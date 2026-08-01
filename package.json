@@ -1,0 +1,49 @@
+{
+	"name": "@hwj123weijian/pi-feishu",
+	"version": "0.2.0",
+	"description": "Minimal Feishu private-chat bridge for Pi",
+	"type": "module",
+	"license": "MIT",
+	"publishConfig": {
+		"access": "public",
+		"registry": "https://registry.npmjs.org/"
+	},
+	"keywords": [
+		"pi-package",
+		"feishu",
+		"coding-agent"
+	],
+	"pi": {
+		"extensions": [
+			"./src/extension.ts"
+		]
+	},
+	"files": [
+		"src",
+		"README.md",
+		"LICENSE",
+		".env.example"
+	],
+	"scripts": {
+		"build": "tsc -p tsconfig.build.json",
+		"check": "biome check . && tsc --noEmit",
+		"test": "vitest run",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@larksuiteoapi/node-sdk": "1.72.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "0.83.0"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "2.3.5",
+		"@earendil-works/pi-coding-agent": "0.83.0",
+		"@types/node": "24.12.4",
+		"typescript": "5.9.3",
+		"vitest": "4.1.9"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	}
+}
