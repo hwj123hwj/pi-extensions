@@ -21,6 +21,15 @@ export interface FeishuIncomingMessage {
 
 export type FeishuMessageHandler = (message: FeishuIncomingMessage) => Promise<void> | void;
 
+export interface FeishuReactionEvent {
+	messageId: string;
+	operatorOpenId: string;
+	emojiType: string;
+	action: "added" | "removed";
+}
+
+export type FeishuReactionHandler = (event: FeishuReactionEvent) => void;
+
 export interface FeishuReplySnapshot {
 	text: string;
 	status: "正在思考" | "正在生成回复" | "正在执行工具" | "已完成" | "处理失败" | "已取消";
@@ -36,8 +45,59 @@ export interface FeishuReply {
 export interface FeishuGateway {
 	connect(handler: FeishuMessageHandler): Promise<void>;
 	disconnect(): Promise<void>;
-	sendText(chatId: string, text: string, replyTo?: string): Promise<void>;
+	/** Sends text and resolves with the sent Feishu message id (for later recall). */
+	sendText(chatId: string, text: string, replyTo?: string): Promise<string | undefined>;
 	beginReply(chatId: string, replyTo: string): Promise<FeishuReply>;
+	/** Edits an already-sent text message in place. */
+	editText(messageId: string, text: string): Promise<void>;
+	/** Adds an emoji reaction to a message and returns the Feishu reaction id. */
+	addReaction(messageId: string, emojiType: string): Promise<string>;
+	removeReaction(messageId: string, reactionId: string): Promise<void>;
+	recallMessage(messageId: string): Promise<void>;
+	/** Subscribes to emoji reactions on messages visible to the bot. */
+	onReaction(handler: FeishuReactionHandler): () => void;
+}
+
+export interface FeishuStatus {
+	configured: boolean;
+	running: boolean;
+	ownerOpenId?: string;
+	appId?: string;
+	source?: "environment" | "file";
+	pendingMessages: number;
+}
+
+export interface PiRuntimeSnapshot {
+	streaming: boolean;
+	model?: string;
+	thinkingLevel?: string;
+	contextPercent?: number;
+}
+
+export interface PiModelInfo {
+	id: string;
+	name: string;
+	provider: string;
+}
+
+/**
+ * Exposes the Pi runtime capabilities needed by remote slash commands.
+ * Implementations must be defensive: the captured context goes stale after
+ * a session switch, so methods may become no-ops until the next event.
+ */
+export interface PiRuntime {
+	isIdle(): boolean;
+	abort(): void;
+	compact(): void;
+	/** Returns false when the runtime is unavailable or the switch was cancelled. */
+	newSession(): Promise<boolean>;
+	/** Returns false when the requested thinking level does not exist. */
+	setThinkingLevel(level: string): Promise<boolean>;
+	/** Models the user can currently switch to. */
+	listModels(): PiModelInfo[];
+	/** Switches by fuzzy id/name match; throws with a user-facing reason on failure. */
+	switchModel(query: string): Promise<PiModelInfo>;
+	snapshot(): PiRuntimeSnapshot;
 }
 
 export type AgentActivity = { kind: "thinking" } | { kind: "tool"; toolName: string };

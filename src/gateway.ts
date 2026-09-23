@@ -3,6 +3,8 @@ import type {
 	FeishuCredentials,
 	FeishuGateway,
 	FeishuMessageHandler,
+	FeishuReactionEvent,
+	FeishuReactionHandler,
 	FeishuReply,
 	FeishuReplySnapshot,
 } from "./contracts.js";
@@ -18,10 +20,16 @@ export interface NormalizedChannelMessage {
 
 export interface ChannelLike {
 	onMessage(handler: (message: NormalizedChannelMessage) => Promise<void> | void): () => void;
+	onReaction(handler: FeishuReactionHandler): () => void;
 	connect(): Promise<void>;
 	disconnect(): Promise<void>;
-	sendText(to: string, text: string, replyTo?: string): Promise<void>;
+	/** Sends text and resolves with the sent Feishu message id (for later recall). */
+	sendText(to: string, text: string, replyTo?: string): Promise<string | undefined>;
 	startCardStream(to: string, card: object, replyTo?: string): Promise<ChannelCardStream>;
+	editText(messageId: string, text: string): Promise<void>;
+	addReaction(messageId: string, emojiType: string): Promise<string>;
+	removeReaction(messageId: string, reactionId: string): Promise<void>;
+	recallMessage(messageId: string): Promise<void>;
 }
 
 export interface ChannelCardStream {
@@ -34,8 +42,10 @@ export type ChannelFactory = (credentials: FeishuCredentials) => ChannelLike;
 export class SdkFeishuGateway implements FeishuGateway {
 	private readonly credentials: FeishuCredentials;
 	private readonly channelFactory: ChannelFactory;
+	private readonly reactionHandlers = new Set<FeishuReactionHandler>();
 	private channel: ChannelLike | undefined;
 	private unsubscribe: (() => void) | undefined;
+	private reactionUnsubscribe: (() => void) | undefined;
 
 	constructor(credentials: FeishuCredentials, channelFactory: ChannelFactory = createOfficialChannel) {
 		this.credentials = credentials;
@@ -55,14 +65,20 @@ export class SdkFeishuGateway implements FeishuGateway {
 				text: message.content,
 			}),
 		);
+		const reactionUnsubscribe = channel.onReaction((event) => {
+			for (const reactionHandler of this.reactionHandlers) reactionHandler(event);
+		});
 		this.channel = channel;
 		this.unsubscribe = unsubscribe;
+		this.reactionUnsubscribe = reactionUnsubscribe;
 		try {
 			await channel.connect();
 		} catch (error) {
 			this.channel = undefined;
 			this.unsubscribe = undefined;
+			this.reactionUnsubscribe = undefined;
 			unsubscribe();
+			reactionUnsubscribe();
 			await channel.disconnect().catch(() => undefined);
 			throw error;
 		}
@@ -73,13 +89,44 @@ export class SdkFeishuGateway implements FeishuGateway {
 		this.channel = undefined;
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
+		this.reactionUnsubscribe?.();
+		this.reactionUnsubscribe = undefined;
 		if (channel) await channel.disconnect();
 	}
 
-	async sendText(chatId: string, text: string, replyTo?: string): Promise<void> {
+	onReaction(handler: FeishuReactionHandler): () => void {
+		this.reactionHandlers.add(handler);
+		return () => this.reactionHandlers.delete(handler);
+	}
+
+	async sendText(chatId: string, text: string, replyTo?: string): Promise<string | undefined> {
 		const channel = this.channel;
 		if (!channel) throw new Error("飞书长连接尚未启动。");
-		await channel.sendText(chatId, text, replyTo);
+		return channel.sendText(chatId, text, replyTo);
+	}
+
+	async addReaction(messageId: string, emojiType: string): Promise<string> {
+		const channel = this.channel;
+		if (!channel) throw new Error("飞书长连接尚未启动。");
+		return channel.addReaction(messageId, emojiType);
+	}
+
+	async removeReaction(messageId: string, reactionId: string): Promise<void> {
+		const channel = this.channel;
+		if (!channel) throw new Error("飞书长连接尚未启动。");
+		await channel.removeReaction(messageId, reactionId);
+	}
+
+	async recallMessage(messageId: string): Promise<void> {
+		const channel = this.channel;
+		if (!channel) throw new Error("飞书长连接尚未启动。");
+		await channel.recallMessage(messageId);
+	}
+
+	async editText(messageId: string, text: string): Promise<void> {
+		const channel = this.channel;
+		if (!channel) throw new Error("飞书长连接尚未启动。");
+		await channel.editText(messageId, text);
 	}
 
 	async beginReply(chatId: string, replyTo: string): Promise<FeishuReply> {
@@ -139,6 +186,17 @@ class OfficialChannelAdapter implements ChannelLike {
 		return this.channel.on("message", (message) => handler(toChannelMessage(message)));
 	}
 
+	onReaction(handler: FeishuReactionHandler): () => void {
+		return this.channel.on("reaction", (event) =>
+			handler({
+				messageId: event.messageId,
+				operatorOpenId: event.operator.openId,
+				emojiType: event.emojiType,
+				action: event.action,
+			}),
+		);
+	}
+
 	async connect(): Promise<void> {
 		await this.channel.connect();
 	}
@@ -147,8 +205,25 @@ class OfficialChannelAdapter implements ChannelLike {
 		await this.channel.disconnect();
 	}
 
-	async sendText(to: string, text: string, replyTo?: string): Promise<void> {
-		await this.channel.send(to, { text }, replyTo ? { replyTo } : undefined);
+	async sendText(to: string, text: string, replyTo?: string): Promise<string | undefined> {
+		const result = await this.channel.send(to, { text }, replyTo ? { replyTo } : undefined);
+		return result.messageId;
+	}
+
+	async editText(messageId: string, text: string): Promise<void> {
+		await this.channel.editMessage(messageId, text);
+	}
+
+	async addReaction(messageId: string, emojiType: string): Promise<string> {
+		return this.channel.addReaction(messageId, emojiType);
+	}
+
+	async removeReaction(messageId: string, reactionId: string): Promise<void> {
+		await this.channel.removeReaction(messageId, reactionId);
+	}
+
+	async recallMessage(messageId: string): Promise<void> {
+		await this.channel.recallMessage(messageId);
 	}
 
 	async startCardStream(to: string, card: object, replyTo?: string): Promise<ChannelCardStream> {

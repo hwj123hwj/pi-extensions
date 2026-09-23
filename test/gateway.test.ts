@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { FeishuIncomingMessage } from "../src/contracts.js";
+import type { FeishuIncomingMessage, FeishuReactionEvent, FeishuReactionHandler } from "../src/contracts.js";
 import {
 	buildReplyCard,
 	type ChannelCardStream,
@@ -16,13 +16,33 @@ class FakeChannel implements ChannelLike {
 	sent: Array<{ to: string; text: string; replyTo?: string }> = [];
 	streamedCards: object[] = [];
 	streamFinished = false;
+	reactions: Array<{ messageId: string; emojiType: string }> = [];
+	removedReactions: Array<{ messageId: string; reactionId: string }> = [];
+	recalled: string[] = [];
+	edits: Array<{ messageId: string; text: string }> = [];
+	reactionEvents: FeishuReactionEvent[] = [];
+	nextId = 1;
+	nextReactionId = "reaction_1";
+	failReactions = false;
 	private messageHandler: ((message: NormalizedChannelMessage) => Promise<void> | void) | undefined;
+	private reactionHandler: FeishuReactionHandler | undefined;
 
 	onMessage(handler: (message: NormalizedChannelMessage) => Promise<void> | void): () => void {
 		this.messageHandler = handler;
 		return () => {
 			this.messageHandler = undefined;
 		};
+	}
+
+	onReaction(handler: FeishuReactionHandler): () => void {
+		this.reactionHandler = handler;
+		return () => {
+			this.reactionHandler = undefined;
+		};
+	}
+
+	emitReaction(event: FeishuReactionEvent): void {
+		this.reactionHandler?.(event);
 	}
 
 	async connect(): Promise<void> {
@@ -33,8 +53,30 @@ class FakeChannel implements ChannelLike {
 		this.disconnectCalls += 1;
 	}
 
-	async sendText(to: string, text: string, replyTo?: string): Promise<void> {
+	async sendText(to: string, text: string, replyTo?: string): Promise<string | undefined> {
 		this.sent.push(replyTo ? { to, text, replyTo } : { to, text });
+		return `om_sent_${this.nextId++}`;
+	}
+
+	async editText(messageId: string, text: string): Promise<void> {
+		this.edits.push({ messageId, text });
+	}
+
+	async recallMessage(messageId: string): Promise<void> {
+		this.recalled.push(messageId);
+	}
+
+	async addReaction(messageId: string, emojiType: string): Promise<string> {
+		if (this.failReactions) throw new Error("reaction permission missing");
+		this.reactions.push({ messageId, emojiType });
+		const reactionId = this.nextReactionId;
+		const sequence = Number(reactionId.slice("reaction_".length)) || 1;
+		this.nextReactionId = `reaction_${sequence + 1}`;
+		return reactionId;
+	}
+
+	async removeReaction(messageId: string, reactionId: string): Promise<void> {
+		this.removedReactions.push({ messageId, reactionId });
 	}
 
 	async startCardStream(_to: string, card: object, _replyTo?: string): Promise<ChannelCardStream> {
@@ -97,6 +139,46 @@ describe("SdkFeishuGateway", () => {
 		await validateSdkCredentials({ appId: "cli_test", appSecret: "secret" }, createFactory(channel));
 		expect(channel.connectCalls).toBe(1);
 		expect(channel.disconnectCalls).toBe(1);
+	});
+
+	it("delegates emoji reactions and recall to the underlying channel", async () => {
+		const channel = new FakeChannel();
+		const gateway = new SdkFeishuGateway({ appId: "cli_test", appSecret: "secret" }, createFactory(channel));
+		await gateway.connect(() => undefined);
+
+		const sentId = await gateway.sendText("oc_1", "hi");
+		const reactionId = await gateway.addReaction("om_1", "THINKING");
+		await gateway.removeReaction("om_1", reactionId);
+		await gateway.recallMessage("om_sent_1");
+		await gateway.editText("om_sent_1", "updated");
+
+		expect(sentId).toBe("om_sent_1");
+		expect(reactionId).toBe("reaction_1");
+		expect(channel.reactions).toEqual([{ messageId: "om_1", emojiType: "THINKING" }]);
+		expect(channel.removedReactions).toEqual([{ messageId: "om_1", reactionId: "reaction_1" }]);
+		expect(channel.recalled).toEqual(["om_sent_1"]);
+		expect(channel.edits).toEqual([{ messageId: "om_sent_1", text: "updated" }]);
+	});
+
+	it("forwards channel reactions to subscribers registered before connect", async () => {
+		const channel = new FakeChannel();
+		const gateway = new SdkFeishuGateway({ appId: "cli_test", appSecret: "secret" }, createFactory(channel));
+		const received: FeishuReactionEvent[] = [];
+		gateway.onReaction((event) => received.push(event));
+
+		await gateway.connect(() => undefined);
+		channel.emitReaction({
+			messageId: "om_1",
+			operatorOpenId: "ou_owner",
+			emojiType: "CrossMark",
+			action: "added",
+		});
+		await gateway.disconnect();
+		channel.emitReaction({ messageId: "om_2", operatorOpenId: "ou_owner", emojiType: "NO", action: "added" });
+
+		expect(received).toEqual([
+			{ messageId: "om_1", operatorOpenId: "ou_owner", emojiType: "CrossMark", action: "added" },
+		]);
 	});
 
 	it("keeps one interactive reply card updated through progress and finalization", async () => {

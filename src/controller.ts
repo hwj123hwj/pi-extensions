@@ -7,18 +7,40 @@ import type {
 	FeishuGateway,
 	FeishuGatewayFactory,
 	FeishuIncomingMessage,
+	FeishuReactionEvent,
 	FeishuReply,
+	FeishuStatus,
+	PiRuntime,
 } from "./contracts.js";
 import { CredentialError, errorMessage, resolveCredentialInput, resolveRuntimeCredentials } from "./credentials.js";
 import { MessageDeduplicator } from "./message-deduplicator.js";
 import { SerialMessageQueue } from "./message-queue.js";
 import { OwnerBinding } from "./owner-binding.js";
+import { executeRemoteCommand, parseRemoteCommand } from "./remote-commands.js";
+
+// 与 easycodeclient 的飞书集成一致：THINKING 表情兼作"已读 + 处理中"回执。
+const READ_REACTION_EMOJI = "THINKING";
+
+interface PendingTask {
+	messageId: string;
+	chatId: string;
+	reactionId: string;
+	tipText: string;
+	tipMessageId: string | undefined;
+	started: boolean;
+	cancelled: boolean;
+}
+
+function queueTipText(position: number): string {
+	return `⏳ 已收到，排队中（第 ${position} 位），将在当前任务完成后处理。`;
+}
 
 export interface FeishuControllerOptions {
 	store: CredentialStore;
 	gatewayFactory: FeishuGatewayFactory;
 	validateCredentials: CredentialValidator;
 	agent: AgentBridge;
+	runtime?: PiRuntime;
 	generateBindingCode?: () => string;
 }
 
@@ -27,26 +49,20 @@ export interface FeishuStartResult {
 	bindingCode?: string;
 }
 
-export interface FeishuStatus {
-	configured: boolean;
-	running: boolean;
-	ownerOpenId?: string;
-	appId?: string;
-	source?: "environment" | "file";
-	pendingMessages: number;
-}
-
 export class FeishuController {
 	private readonly store: CredentialStore;
 	private readonly gatewayFactory: FeishuGatewayFactory;
 	private readonly validateCredentials: CredentialValidator;
 	private readonly agent: AgentBridge;
+	private readonly runtime: PiRuntime | undefined;
 	private readonly generateBindingCode: (() => string) | undefined;
 	private readonly queue = new SerialMessageQueue();
 	private readonly deduplicator = new MessageDeduplicator();
 	private gateway: FeishuGateway | undefined;
 	private credentials: FeishuCredentials | undefined;
 	private binding: OwnerBinding | undefined;
+	private environment: Environment = {};
+	private readonly pendingTasks = new Map<string, PendingTask>();
 	private readonly activeReplies = new Set<FeishuReply>();
 
 	constructor(options: FeishuControllerOptions) {
@@ -54,6 +70,7 @@ export class FeishuController {
 		this.gatewayFactory = options.gatewayFactory;
 		this.validateCredentials = options.validateCredentials;
 		this.agent = options.agent;
+		this.runtime = options.runtime;
 		this.generateBindingCode = options.generateBindingCode;
 	}
 
@@ -91,6 +108,7 @@ export class FeishuController {
 		this.credentials = credentials;
 		this.binding = binding;
 		this.gateway = gateway;
+		this.environment = environment;
 		this.deduplicator.clear();
 
 		try {
@@ -101,6 +119,7 @@ export class FeishuController {
 			await gateway.disconnect().catch(() => undefined);
 			throw new CredentialError(`启动飞书长连接失败：${errorMessage(error, credentials)}`);
 		}
+		gateway.onReaction((event) => this.handleReaction(event));
 
 		const bindingCode = binding.getOrCreateCode();
 		return bindingCode ? { alreadyRunning: false, bindingCode } : { alreadyRunning: false };
@@ -109,6 +128,8 @@ export class FeishuController {
 	async stop(): Promise<boolean> {
 		const gateway = this.gateway;
 		if (!gateway) return false;
+		for (const entry of this.pendingTasks.values()) entry.cancelled = true;
+		this.pendingTasks.clear();
 		await Promise.all([...this.activeReplies].map((reply) => reply.cancel().catch(() => undefined)));
 		this.activeReplies.clear();
 		this.gateway = undefined;
@@ -149,60 +170,139 @@ export class FeishuController {
 		if (!gateway || !binding || message.chatType !== "p2p" || message.contentType !== "text") return;
 		if (!message.messageId || !this.deduplicator.accept(message.messageId)) return;
 
+		const reactionId = await this.ackRead(gateway, message.messageId);
 		const authorization = binding.authorize(message.senderOpenId, message.text);
 		switch (authorization.kind) {
 			case "binding-required":
-				await this.safeSend(gateway, message, "Bot 尚未绑定，请在本地 Pi 查看一次性绑定码。");
+				await this.acknowledge(gateway, message, reactionId, "Bot 尚未绑定，请在本地 Pi 查看一次性绑定码。");
 				return;
 			case "invalid-binding-code":
-				await this.safeSend(gateway, message, "绑定码无效，请检查本地 Pi 显示的一次性绑定码。");
+				await this.acknowledge(gateway, message, reactionId, "绑定码无效，请检查本地 Pi 显示的一次性绑定码。");
 				return;
 			case "unauthorized":
-				await this.safeSend(gateway, message, "未授权：此 Bot 仅响应已绑定的 Owner。");
+				await this.acknowledge(gateway, message, reactionId, "未授权：此 Bot 仅响应已绑定的 Owner。");
 				return;
 			case "bound":
 				await this.persistOwner(authorization.ownerOpenId);
-				await this.safeSend(gateway, message, "绑定成功，现在可以直接发送问题。");
+				await this.acknowledge(gateway, message, reactionId, "绑定成功，现在可以直接发送问题。");
 				return;
 			case "authorized":
-				void this.queue.enqueue(async () => {
-					if (this.gateway !== gateway) return;
-					const reply = await gateway.beginReply(message.chatId, message.messageId).catch(() => undefined);
-					if (reply) this.activeReplies.add(reply);
-					let latestText = "";
-					try {
-						const response = await this.agent.run(authorization.text, {
-							onText: (text) => {
-								latestText = text;
-								reply?.update({ text, status: "正在生成回复" });
-							},
-							onActivity: (activity) => {
-								reply?.update({
-									text: latestText,
-									status: activity.kind === "tool" ? "正在执行工具" : "正在思考",
-								});
-							},
-						});
-						if (this.gateway === gateway) {
-							if (reply) {
-								await reply.complete({ text: response, status: "已完成" });
-							} else {
-								await gateway.sendText(message.chatId, response, message.messageId);
-							}
-						}
-					} catch {
-						if (this.gateway === gateway) {
-							if (reply) {
-								await reply.fail();
-							} else {
-								await this.safeSend(gateway, message, "处理消息失败，请稍后再试。");
-							}
-						}
-					} finally {
-						if (reply) this.activeReplies.delete(reply);
-					}
-				});
+				if (parseRemoteCommand(authorization.text)) {
+					// 斜杠命令快速通道：不进入消息队列，也不进入 LLM 上下文。
+					await this.runRemoteCommand(gateway, message, reactionId, authorization.text);
+					return;
+				}
+				void this.enqueueAgentTask(gateway, message, authorization.text, reactionId);
 		}
+	}
+
+	private enqueueAgentTask(
+		gateway: FeishuGateway,
+		message: FeishuIncomingMessage,
+		text: string,
+		reactionId: string,
+	): void {
+		const entry: PendingTask = {
+			messageId: message.messageId,
+			chatId: message.chatId,
+			reactionId,
+			tipText: "",
+			tipMessageId: undefined,
+			started: false,
+			cancelled: false,
+		};
+		// Map 保持插入顺序：首位是正在处理的任务，其余按排队先后排列。
+		const position = this.pendingTasks.size + 1;
+		this.pendingTasks.set(message.messageId, entry);
+
+		if (position > 1) {
+			entry.tipText = queueTipText(position);
+			void gateway
+				.sendText(message.chatId, entry.tipText, message.messageId)
+				.then((tipId) => {
+					if (!tipId) return;
+					// 提示送达时任务已开工或已取消：提示已无意义，直接撤回。
+					if (entry.cancelled || entry.started) {
+						void gateway.recallMessage(tipId).catch(() => undefined);
+						return;
+					}
+					entry.tipMessageId = tipId;
+					this.refreshQueueTips(gateway);
+				})
+				.catch(() => undefined);
+		}
+
+		void this.queue.enqueue(async () => {
+			entry.started = true;
+			try {
+				this.recallTip(gateway, entry);
+				if (this.gateway !== gateway) return;
+				// 被取消的任务静默跳过：回执与提示已由取消方清理。
+				if (entry.cancelled) return;
+				await this.processWithAgent(gateway, message, text);
+			} finally {
+				this.pendingTasks.delete(message.messageId);
+				this.refreshQueueTips(gateway);
+				await this.clearRead(gateway, message.messageId, reactionId);
+			}
+		});
+	}
+
+	private recallTip(gateway: FeishuGateway, entry: PendingTask): void {
+		const tipId = entry.tipMessageId;
+		if (!tipId) return;
+		entry.tipMessageId = undefined;
+		void gateway.recallMessage(tipId).catch(() => undefined);
+	}
+
+	/** 排队提示动态改位：前方的任务完成或被移除后，剩余提示更新为新位数。 */
+	private refreshQueueTips(gateway: FeishuGateway): void {
+		let position = 0;
+		for (const entry of this.pendingTasks.values()) {
+			position += 1;
+			// 首位要么正在处理、要么即将开工（提示随即撤回），无需改写。
+			if (position === 1 || entry.started || !entry.tipMessageId) continue;
+			const text = queueTipText(position);
+			if (text === entry.tipText) continue;
+			entry.tipText = text;
+			void gateway.editText(entry.tipMessageId, text).catch(() => undefined);
+		}
+	}
+
+	/** 中止当前任务之后的所有排队消息，返回跳过数量。 */
+	private stopQueuedMessages(gateway: FeishuGateway): number {
+		let skipped = 0;
+		for (const entry of [...this.pendingTasks.values()]) {
+			if (entry.started) continue;
+			entry.cancelled = true;
+			skipped += 1;
+			this.recallTip(gateway, entry);
+			void this.clearRead(gateway, entry.messageId, entry.reactionId);
+			entry.reactionId = "";
+			// 立即移出登记表：后续提示改位不再把它算作在队。
+			this.pendingTasks.delete(entry.messageId);
+		}
+		return skipped;
+	}
+
+	/** Owner 在排队中的消息上点 ❌（或 NO）表情：取消该消息并清理提示与回执。 */
+	handleReaction(event: FeishuReactionEvent): void {
+		const gateway = this.gateway;
+		const binding = this.binding;
+		if (!gateway || !binding) return;
+		if (event.action !== "added") return;
+		const normalized = event.emojiType.toLowerCase();
+		if (normalized !== "crossmark" && normalized !== "no") return;
+		if (event.operatorOpenId !== binding.ownerOpenId) return;
+		const entry = this.pendingTasks.get(event.messageId);
+		if (!entry || entry.started || entry.cancelled) return;
+
+		entry.cancelled = true;
+		this.recallTip(gateway, entry);
+		void this.clearRead(gateway, entry.messageId, entry.reactionId);
+		entry.reactionId = "";
+		this.pendingTasks.delete(entry.messageId);
+		this.refreshQueueTips(gateway);
 	}
 
 	async waitForIdle(): Promise<void> {
@@ -219,6 +319,82 @@ export class FeishuController {
 		const next = { ...credentials, ownerOpenId };
 		await this.store.save(next);
 		this.credentials = next;
+	}
+
+	private async processWithAgent(gateway: FeishuGateway, message: FeishuIncomingMessage, text: string): Promise<void> {
+		if (this.gateway !== gateway) return;
+		const reply = await gateway.beginReply(message.chatId, message.messageId).catch(() => undefined);
+		if (reply) this.activeReplies.add(reply);
+		let latestText = "";
+		try {
+			const response = await this.agent.run(text, {
+				onText: (latest) => {
+					latestText = latest;
+					reply?.update({ text: latest, status: "正在生成回复" });
+				},
+				onActivity: (activity) => {
+					reply?.update({
+						text: latestText,
+						status: activity.kind === "tool" ? "正在执行工具" : "正在思考",
+					});
+				},
+			});
+			if (this.gateway === gateway) {
+				if (reply) {
+					await reply.complete({ text: response, status: "已完成" });
+				} else {
+					await gateway.sendText(message.chatId, response, message.messageId);
+				}
+			}
+		} catch {
+			if (this.gateway === gateway) {
+				if (reply) {
+					await reply.fail();
+				} else {
+					await this.safeSend(gateway, message, "处理消息失败，请稍后再试。");
+				}
+			}
+		} finally {
+			if (reply) this.activeReplies.delete(reply);
+		}
+	}
+
+	private async runRemoteCommand(
+		gateway: FeishuGateway,
+		message: FeishuIncomingMessage,
+		reactionId: string,
+		text: string,
+	): Promise<void> {
+		const replyText = await executeRemoteCommand(text, {
+			runtime: this.runtime,
+			status: () => this.status(this.environment),
+			stopQueue: () => this.stopQueuedMessages(gateway),
+		}).catch((error: unknown) => `执行命令出错：${this.sanitizeError(error)}`);
+		await this.acknowledge(gateway, message, reactionId, replyText);
+	}
+
+	private async ackRead(gateway: FeishuGateway, messageId: string): Promise<string> {
+		try {
+			return await gateway.addReaction(messageId, READ_REACTION_EMOJI);
+		} catch {
+			// 表情权限缺失时静默降级：不影响正常的收发消息流程。
+			return "";
+		}
+	}
+
+	private async clearRead(gateway: FeishuGateway, messageId: string, reactionId: string): Promise<void> {
+		if (!reactionId) return;
+		await gateway.removeReaction(messageId, reactionId).catch(() => undefined);
+	}
+
+	private async acknowledge(
+		gateway: FeishuGateway,
+		message: FeishuIncomingMessage,
+		reactionId: string,
+		text: string,
+	): Promise<void> {
+		await this.safeSend(gateway, message, text);
+		await this.clearRead(gateway, message.messageId, reactionId);
 	}
 
 	private async safeSend(gateway: FeishuGateway, message: FeishuIncomingMessage, text: string): Promise<void> {
