@@ -4,7 +4,9 @@ import { PiAgentBridge } from "../src/pi-agent-bridge.js";
 describe("PiAgentBridge", () => {
 	it("submits a user message and resolves with the final assistant text when the agent settles", async () => {
 		const submitted: string[] = [];
-		const bridge = new PiAgentBridge((text) => submitted.push(text));
+		const bridge = new PiAgentBridge((text) => {
+			submitted.push(text);
+		});
 
 		const response = bridge.run("hello");
 		expect(submitted).toEqual(["hello"]);

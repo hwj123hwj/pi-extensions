@@ -17,6 +17,7 @@ import { MessageDeduplicator } from "./message-deduplicator.js";
 import { SerialMessageQueue } from "./message-queue.js";
 import { OwnerBinding } from "./owner-binding.js";
 import { executeRemoteCommand, parseRemoteCommand } from "./remote-commands.js";
+import { buildGroupPermissionReminder } from "./scopes.js";
 
 // 与 easycodeclient 的飞书集成一致：THINKING 表情兼作"已读 + 处理中"回执。
 const READ_REACTION_EMOJI = "THINKING";
@@ -91,6 +92,7 @@ export class FeishuController {
 						...credentials,
 						...(existing.ownerOpenId ? { ownerOpenId: existing.ownerOpenId } : {}),
 						...(existing.managedGroupIds ? { managedGroupIds: existing.managedGroupIds } : {}),
+						...(existing.groupSessions ? { groupSessions: existing.groupSessions } : {}),
 					}
 				: credentials;
 		await this.store.save(next);
@@ -147,9 +149,47 @@ export class FeishuController {
 		}
 		await gateway.sendText(
 			chatId,
-			`👋 群聊「${name}」已创建，当前绑定的 Pi 飞书机器人已就绪。直接在群内 @机器人即可开始协作。`,
+			`👋 群聊「${name}」已创建，当前绑定的 Pi 飞书机器人已就绪。直接在群内 @机器人即可开始协作。若群内普通消息没有响应，请先 @ 机器人；开通免 @ 权限后可直接发消息。`,
 		);
+		await this.sendGroupPermissionReminder(gateway, ownerOpenId, name);
 		return chatId;
+	}
+
+	getChatSessionFile(chatId: string): string | undefined {
+		return this.credentials?.groupSessions?.[chatId];
+	}
+
+	async setChatSessionFile(chatId: string, sessionFile: string): Promise<void> {
+		const credentials = this.credentials;
+		if (!credentials) return;
+		const updated = {
+			...credentials,
+			groupSessions: { ...(credentials.groupSessions ?? {}), [chatId]: sessionFile },
+		};
+		await this.store.save(updated);
+		this.credentials = updated;
+	}
+
+	private async sendGroupPermissionReminder(
+		gateway: FeishuGateway,
+		ownerOpenId: string,
+		groupName: string,
+	): Promise<void> {
+		const credentials = this.credentials;
+		if (!credentials) return;
+		let grantedScopes: string[] | undefined;
+		try {
+			grantedScopes = (await gateway.probeGrantedScopes?.())?.grantedScopes;
+		} catch {
+			grantedScopes = undefined;
+		}
+		const reminder = buildGroupPermissionReminder({
+			appId: credentials.appId,
+			groupName,
+			...(grantedScopes ? { grantedScopes } : {}),
+		});
+		if (!reminder) return;
+		await gateway.sendText(ownerOpenId, reminder).catch(() => undefined);
 	}
 
 	async stop(): Promise<boolean> {
@@ -171,6 +211,19 @@ export class FeishuController {
 		if (!stopped) this.agent.cancel("飞书已退出。");
 		this.credentials = undefined;
 		await this.store.clear();
+	}
+
+	/** 读取应用已开通 scope 列表（用于权限健康度检查）。未连接或 probe 失败时返回空对象。 */
+	async probeScopes(): Promise<{ grantedScopes?: string[] }> {
+		try {
+			return (await this.gateway?.probeGrantedScopes?.()) ?? {};
+		} catch {
+			return {};
+		}
+	}
+
+	get appId(): string | undefined {
+		return this.credentials?.appId;
 	}
 
 	async status(environment: Environment): Promise<FeishuStatus> {
@@ -355,18 +408,22 @@ export class FeishuController {
 		if (reply) this.activeReplies.add(reply);
 		let latestText = "";
 		try {
-			const response = await this.agent.run(text, {
-				onText: (latest) => {
-					latestText = latest;
-					reply?.update({ text: latest, status: "正在生成回复" });
+			const response = await this.agent.run(
+				text,
+				{
+					onText: (latest) => {
+						latestText = latest;
+						reply?.update({ text: latest, status: "正在生成回复" });
+					},
+					onActivity: (activity) => {
+						reply?.update({
+							text: latestText,
+							status: activity.kind === "tool" ? "正在执行工具" : "正在思考",
+						});
+					},
 				},
-				onActivity: (activity) => {
-					reply?.update({
-						text: latestText,
-						status: activity.kind === "tool" ? "正在执行工具" : "正在思考",
-					});
-				},
-			});
+				message.chatType === "group" ? { chatId: message.chatId } : undefined,
+			);
 			if (this.gateway === gateway) {
 				if (reply) {
 					await reply.complete({ text: response, status: "已完成" });

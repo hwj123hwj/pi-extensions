@@ -7,6 +7,7 @@ import type {
 	FeishuReply,
 	FeishuReplySnapshot,
 } from "./contracts.js";
+import { probeGrantedScopes } from "./scopes.js";
 
 export interface NormalizedChannelMessage {
 	messageId: string;
@@ -123,6 +124,10 @@ export class SdkFeishuGateway implements FeishuGateway {
 		return result.data.chat_id;
 	}
 
+	async probeGrantedScopes(): Promise<{ grantedScopes?: string[] }> {
+		return probeGrantedScopes(this.credentials);
+	}
+
 	async sendText(chatId: string, text: string, replyTo?: string): Promise<string | undefined> {
 		const channel = this.channel;
 		if (!channel) throw new Error("飞书长连接尚未启动。");
@@ -190,8 +195,11 @@ function createOfficialChannel(credentials: FeishuCredentials): ChannelLike {
 			policy: {
 				dmMode: "open",
 				// Controller enforces owner identity and only accepts groups it created.
+				// Keep SDK-side mention filtering off so apps with im:message.group_msg
+				// can receive normal managed-group messages without @. Without that
+				// sensitive scope, Feishu only pushes @bot group events anyway.
 				groupAllowlist: [],
-				requireMention: true,
+				requireMention: false,
 			},
 			safety: {
 				chatQueue: { enabled: false },

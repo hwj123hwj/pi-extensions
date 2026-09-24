@@ -3,6 +3,8 @@ export interface FeishuCredentials {
 	appSecret: string;
 	ownerOpenId?: string;
 	managedGroupIds?: string[];
+	/** Per managed group Pi session file. Missing value is backfilled on the group's first message. */
+	groupSessions?: Record<string, string>;
 }
 
 export interface CredentialStore {
@@ -47,6 +49,8 @@ export interface FeishuGateway {
 	connect(handler: FeishuMessageHandler): Promise<void>;
 	disconnect(): Promise<void>;
 	createGroupChat(name: string, ownerOpenId: string): Promise<string>;
+	/** Best-effort application scope audit. Undefined grantedScopes means the app cannot read its scope list yet. */
+	probeGrantedScopes?(): Promise<{ grantedScopes?: string[] }>;
 	/** Sends text and resolves with the sent Feishu message id (for later recall). */
 	sendText(chatId: string, text: string, replyTo?: string): Promise<string | undefined>;
 	beginReply(chatId: string, replyTo: string): Promise<FeishuReply>;
@@ -109,8 +113,13 @@ export interface AgentProgressObserver {
 	onActivity?: (activity: AgentActivity) => void;
 }
 
+export interface AgentRunOptions {
+	/** Route this turn through the Pi session bound to the Feishu chat. */
+	chatId?: string;
+}
+
 export interface AgentBridge {
-	run(text: string, observer?: AgentProgressObserver): Promise<string>;
+	run(text: string, observer?: AgentProgressObserver, options?: AgentRunOptions): Promise<string>;
 	cancel(reason?: string): void;
 }
 

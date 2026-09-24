@@ -6,19 +6,30 @@ import { CredentialError, FileCredentialStore } from "./credentials.js";
 import { SdkFeishuGateway, validateSdkCredentials } from "./gateway.js";
 import { PiAgentBridge } from "./pi-agent-bridge.js";
 import { THINKING_LEVELS } from "./remote-commands.js";
+import {
+	buildEventSubUrl,
+	buildPermissionPageUrl,
+	buildScopeApplyUrl,
+	hasScope,
+	missingScopes,
+	REQUIRED_APP_SCOPES,
+	SENSITIVE_GROUP_MSG_SCOPE,
+} from "./scopes.js";
 
 type FeishuCommandName = "help" | "setup" | "start" | "stop" | "status" | "logout";
 type PiModel = NonNullable<ExtensionContext["model"]>;
 type PiThinkingLevel = NonNullable<ExtensionContext["thinkingLevel"]>;
 
 interface SessionLink {
-	bridge: PiAgentBridge;
 	runtime: PiRuntime;
 }
 
 interface SharedFeishuState {
 	controller: FeishuController;
 	current: SessionLink | undefined;
+	activeBridge: PiAgentBridge | undefined;
+	latestCommandContext: ExtensionCommandContext | undefined;
+	sendCurrentMessage: ((text: string) => void) | undefined;
 }
 
 const SHARED_STATE_KEY = "__piFeishuSharedState__";
@@ -33,14 +44,30 @@ function getSharedState(): SharedFeishuState {
 	const existing = host[SHARED_STATE_KEY];
 	if (existing) return existing;
 
-	const state: SharedFeishuState = { current: undefined, controller: undefined as unknown as FeishuController };
+	const state: SharedFeishuState = {
+		current: undefined,
+		activeBridge: undefined,
+		latestCommandContext: undefined,
+		sendCurrentMessage: undefined,
+		controller: undefined as unknown as FeishuController,
+	};
 	const proxyAgent: AgentBridge = {
-		run: (text, observer) => {
-			const link = state.current;
-			if (!link) return Promise.reject(new Error("Pi 会话尚未就绪，请稍后再试。"));
-			return link.bridge.run(text, observer);
+		run: (text, observer, options) => {
+			const bridge = new PiAgentBridge(async (prompt) => {
+				if (options?.chatId) {
+					await sendToChatSession(state, options.chatId, prompt);
+					return;
+				}
+				if (!state.current) throw new Error("Pi 会话尚未就绪，请稍后再试。");
+				if (!state.sendCurrentMessage) throw new Error("Pi 会话尚未就绪，请稍后再试。");
+				state.sendCurrentMessage(prompt);
+			});
+			state.activeBridge = bridge;
+			return bridge.run(text, observer).finally(() => {
+				if (state.activeBridge === bridge) state.activeBridge = undefined;
+			});
 		},
-		cancel: (reason) => state.current?.bridge.cancel(reason),
+		cancel: (reason) => state.activeBridge?.cancel(reason),
 	};
 	const proxyRuntime: PiRuntime = {
 		isIdle: () => state.current?.runtime.isIdle() ?? true,
@@ -65,6 +92,35 @@ function getSharedState(): SharedFeishuState {
 	});
 	host[SHARED_STATE_KEY] = state;
 	return state;
+}
+
+async function sendToChatSession(state: SharedFeishuState, chatId: string, prompt: string): Promise<void> {
+	const context = state.latestCommandContext;
+	if (!context) throw new Error("Pi 会话控制尚未就绪，请先在本地执行一次 /feishu status。");
+
+	const sessionFile = state.controller.getChatSessionFile(chatId);
+	if (sessionFile) {
+		const result = await context.switchSession(sessionFile, {
+			withSession: async (nextContext) => {
+				state.latestCommandContext = nextContext;
+				const currentFile = nextContext.sessionManager.getSessionFile();
+				if (currentFile && currentFile !== sessionFile) await state.controller.setChatSessionFile(chatId, currentFile);
+				await nextContext.sendUserMessage(prompt);
+			},
+		});
+		if (result.cancelled) throw new Error("切换到飞书群绑定的 Pi 会话已取消。");
+		return;
+	}
+
+	const result = await context.newSession({
+		withSession: async (nextContext) => {
+			state.latestCommandContext = nextContext;
+			const currentFile = nextContext.sessionManager.getSessionFile();
+			if (currentFile) await state.controller.setChatSessionFile(chatId, currentFile);
+			await nextContext.sendUserMessage(prompt);
+		},
+	});
+	if (result.cancelled) throw new Error("创建飞书群专属 Pi 会话已取消。");
 }
 
 export interface ParsedFeishuCommand {
@@ -107,29 +163,158 @@ export function renderFeishuHelp(): string {
 	].join("\n");
 }
 
-export function renderFeishuStatus(status: FeishuStatus): string {
+/** 对齐 easycodeclient：start 成功后的仪表盘式提示。 */
+export function renderStartSuccess(status: FeishuStatus, bindingCode?: string): string {
+	const lines: string[] = ["🚀 飞书 Bot 已就绪！"];
+	if (status.appId) lines.push(`  App ID：${status.appId}`);
+	lines.push("  连接：WebSocket 长连接已建立");
+	if (bindingCode) {
+		lines.push(`  Owner：未绑定，一次性绑定码 ${bindingCode}`);
+		lines.push(`  请在飞书私聊 Bot 发送：/bind ${bindingCode}`);
+	} else if (status.ownerOpenId) {
+		lines.push(`  Owner：${status.ownerOpenId}`);
+	}
+	lines.push("", "  现在去飞书给 Bot 发消息试试 👋", "  输入 /feishu stop 停止");
+	return lines.join("\n");
+}
+
+/** 对齐 easycodeclient：缺少凭据时给出可操作的配置指引。 */
+export function renderMissingCredentials(): string {
+	return [
+		"⚠️ 未找到飞书凭证，请先配置：",
+		"  /feishu setup <appId> <appSecret>    # 验证并保存凭据",
+		"  或设置环境变量 FEISHU_APP_ID / FEISHU_APP_SECRET 后执行 /feishu setup",
+	].join("\n");
+}
+
+/**
+ * 对齐 easycodeclient 的 appendPostSetupGuidance：setup 成功后的分步配置引导。
+ * grantedScopes 为 undefined 表示无法读取已开通列表（首次配置很常见），按全部缺失处理。
+ */
+export function renderPostSetupGuidance(appId: string, grantedScopes?: string[]): string {
+	const missing = grantedScopes ? missingScopes(grantedScopes, REQUIRED_APP_SCOPES) : [...REQUIRED_APP_SCOPES];
+	const lines: string[] = [
+		"",
+		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+		"🔧 一键完成下一步配置（强烈建议）",
+		"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+	];
+
+	if (grantedScopes && missing.length === 0) {
+		lines.push("  ✅ 应用已开通全部必需 scope，无需额外申请。");
+	} else {
+		lines.push(
+			grantedScopes
+				? `  📋 第 1 步：一键申请缺失的 ${missing.length} 项权限（自动预选 scope）`
+				: "  📋 第 1 步：一键申请应用所需权限（自动预选 scope）",
+			`     👉 ${buildScopeApplyUrl({ appId, scopes: missing })}`,
+		);
+		if (missing.length > 0 && missing.length <= 12) {
+			lines.push("     需申请的 scope：");
+			for (const scope of missing) lines.push(`       - ${scope}`);
+		}
+	}
+
+	lines.push(
+		"",
+		"  📡 第 2 步：在事件订阅页勾选必要事件",
+		`     👉 ${buildEventSubUrl(appId)}`,
+		"     需订阅事件：",
+		"       - im.message.receive_v1（接收消息）",
+		"       - im.message.recalled_v1（用户撤回消息 → 排队消息同步撤回）",
+		"       - im.chat.member.bot.added_v1（被拉入群通知）",
+		"       - card.action.trigger（卡片按钮回调）",
+		"",
+		"  🔄 第 3 步：申请发布版本",
+		"     在权限管理页申请版本发布，让 scope 生效：",
+		`     👉 ${buildPermissionPageUrl(appId)}`,
+		"",
+	);
+
+	// 🔔 免 @ 敏感权限提示
+	if (!grantedScopes || !hasScope(grantedScopes, SENSITIVE_GROUP_MSG_SCOPE)) {
+		lines.push(
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+			"💬 想让 Bot 在群里「免 @ 直接响应所有消息」？",
+			"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+			"  默认：群里只有 @bot 时才会收到事件（飞书平台层硬规则）。",
+			"  要免 @ 直接响应，必须额外申请「敏感权限」：",
+			`     👉 ${buildScopeApplyUrl({ appId, scopes: [SENSITIVE_GROUP_MSG_SCOPE] })}`,
+			`     权限：\`${SENSITIVE_GROUP_MSG_SCOPE}\` —— 「读取关联群聊内所有消息」`,
+			"  ⚠️ 这是飞书的敏感权限，需要人工审核（一般 1-3 天）。",
+			"  申请页「使用场景说明」可参考：用于 AI 编程助手在专属项目协作群中",
+			"  无需 @ 即可响应团队成员的编程请求和问题，提升协作效率。",
+			"",
+		);
+	}
+	lines.push("  💡 步骤 1-3 完成后，回到 Pi 执行 /feishu start 即可使用！");
+	return lines.join("\n");
+}
+
+/**
+ * 对齐 easycodeclient 的 start 后权限健康检查：probe 权限并追加修复指引。
+ * probe 失败不阻塞主流程，返回原文案。
+ */
+export async function appendScopeHealthHint(
+	appId: string,
+	dashboard: string,
+	grantedScopes?: string[],
+): Promise<string> {
+	if (!grantedScopes) return dashboard;
+	const missing = missingScopes(grantedScopes, REQUIRED_APP_SCOPES);
+	const hasGroupMsg = hasScope(grantedScopes, SENSITIVE_GROUP_MSG_SCOPE);
+	if (missing.length === 0 && hasGroupMsg) {
+		return `${dashboard}\n\n✅ 应用权限配置完整，所有功能均可正常使用。`;
+	}
+	const lines = ["", "⚠️ 以下应用权限尚未开通，对应功能会受限："];
+	if (missing.length > 0) {
+		lines.push(`📋 缺失 ${missing.length} 项基础权限，点击一键申请：`);
+		lines.push(`👉 ${buildScopeApplyUrl({ appId, scopes: missing })}`);
+	}
+	if (!hasGroupMsg) {
+		lines.push("💬 「免 @ 响应」权限未开：群内需 @机器人 才能触发，点击开通：");
+		lines.push(`👉 ${buildScopeApplyUrl({ appId, scopes: [SENSITIVE_GROUP_MSG_SCOPE] })}`);
+	}
+	lines.push("🔄 权限生效（需发布应用版本）：");
+	lines.push(`👉 ${buildPermissionPageUrl(appId)}`);
+	return `${dashboard}\n${lines.join("\n")}`;
+}
+
+export function renderFeishuStatus(status: FeishuStatus, scopeHealth?: string[]): string {
 	if (!status.configured) {
 		return [
-			"飞书状态",
-			"  配置：未配置",
-			`  连接：${status.running ? "已连接" : "未连接"}`,
+			"📊 飞书状态:",
+			"  配置：未配置，请运行 /feishu setup",
+			`  连接：${status.running ? "🟢 运行中" : "🔴 已停止"}`,
 			`  队列：${status.pendingMessages}`,
 		].join("\n");
 	}
-	return [
-		"飞书状态",
-		"  配置：已配置",
+	const lines = [
+		"📊 飞书状态:",
+		"  配置：✅ 已配置",
 		`  App ID：${status.appId ?? "未知"}`,
 		`  来源：${status.source === "environment" ? "环境变量" : "凭据文件"}`,
-		`  连接：${status.running ? "已连接" : "未连接"}`,
+		`  连接：${status.running ? "🟢 运行中" : "🔴 已停止"}`,
 		`  Owner：${status.ownerOpenId ?? "未绑定"}`,
 		`  队列：${status.pendingMessages}`,
-	].join("\n");
+	];
+	// ✨ Mini-doctor：scope 健康度自检（对齐 easycodeclient 的 /feishu status）。
+	if (scopeHealth) {
+		lines.push("");
+		if (scopeHealth.length === 0) {
+			lines.push("  ✅ 应用权限：已开通全部必需 scope");
+		} else {
+			lines.push(`  ⚠️ 应用权限：缺失 ${scopeHealth.length} 项必需 scope`);
+			for (const scope of scopeHealth) lines.push(`       - ${scope}`);
+		}
+	}
+	if (!status.running) lines.push("  运行 /feishu start 启动 Bot");
+	return lines.join("\n");
 }
 
 export default function feishuExtension(pi: ExtensionAPI): void {
 	const state = getSharedState();
-	const bridge = new PiAgentBridge((text) => pi.sendUserMessage(text));
+	state.sendCurrentMessage = (text) => pi.sendUserMessage(text);
 	let latestContext: ExtensionContext | undefined;
 	let latestCommandContext: ExtensionCommandContext | undefined;
 
@@ -138,7 +323,7 @@ export default function feishuExtension(pi: ExtensionAPI): void {
 		abort: () => withRuntimeContext(() => latestContext?.abort()),
 		compact: () => withRuntimeContext(() => latestContext?.compact()),
 		newSession: async () => {
-			const context = latestCommandContext;
+			const context = latestCommandContext ?? state.latestCommandContext;
 			if (!context) return false;
 			try {
 				const result = await context.newSession();
@@ -181,37 +366,63 @@ export default function feishuExtension(pi: ExtensionAPI): void {
 			return snapshot;
 		},
 	};
-	state.current = { bridge, runtime };
+	state.current = { runtime };
+
+	let startupNoticeShown = false;
+	const maybeNotifyFeishuStartup = async (context: ExtensionContext): Promise<void> => {
+		if (startupNoticeShown) return;
+		startupNoticeShown = true;
+		const status = await state.controller.status(process.env);
+		if (!status.configured || status.running) return;
+		if (shouldAutoStartFeishu(process.env)) {
+			const result = await state.controller.start(process.env);
+			const dashboard = renderStartSuccess(await state.controller.status(process.env), result.bindingCode);
+			context.ui.notify(
+				dashboard.replace("🚀 飞书 Bot 已就绪！", "🚀 飞书插件已自动启动，Bot 已就绪！"),
+				result.bindingCode ? "warning" : "info",
+			);
+			return;
+		}
+		context.ui.notify(
+			"飞书插件已加载，但长连接未启动。请执行 /feishu start；如需 Pi 启动后自动连接，可设置 PI_FEISHU_AUTO_START=1。",
+			"warning",
+		);
+	};
 
 	// 每个事件都会带来新的 ExtensionContext；持续刷新，保证远程命令拿到的能力不失效。
 	const trackContext = (_event: unknown, context: ExtensionContext): void => {
 		latestContext = context;
 	};
-	pi.on("session_start", trackContext);
+	pi.on("session_start", (event, context) => {
+		trackContext(event, context);
+		void maybeNotifyFeishuStartup(context).catch((error) => {
+			context.ui.notify(`飞书启动检查失败：${state.controller.sanitizeError(error)}`, "error");
+		});
+	});
 	pi.on("agent_start", trackContext);
 	pi.on("message_end", (event, context) => {
 		trackContext(event, context);
-		bridge.captureMessage(event.message);
+		state.activeBridge?.captureMessage(event.message);
 	});
 	pi.on("message_update", (event, context) => {
 		trackContext(event, context);
-		bridge.captureStreamingMessage(event.message);
+		state.activeBridge?.captureStreamingMessage(event.message);
 	});
 	pi.on("tool_execution_start", (event, context) => {
 		trackContext(event, context);
-		bridge.captureToolStart(event.toolName);
+		state.activeBridge?.captureToolStart(event.toolName);
 	});
 	pi.on("tool_execution_end", (event, context) => {
 		trackContext(event, context);
-		bridge.captureToolEnd();
+		state.activeBridge?.captureToolEnd();
 	});
 	pi.on("agent_settled", (event, context) => {
 		trackContext(event, context);
-		bridge.settle();
+		state.activeBridge?.settle();
 	});
 	pi.on("session_shutdown", () => {
-		// 只解绑本会话的桥：长连接归全局 controller 保管，本地 /new 切换会话后自动延续。
-		bridge.cancel("Pi 会话已关闭。");
+		// 长连接归全局 controller 保管，本地 /new 切换会话后自动延续。
+		state.activeBridge?.cancel("Pi 会话已关闭。");
 	});
 
 	pi.registerTool({
@@ -247,6 +458,7 @@ export default function feishuExtension(pi: ExtensionAPI): void {
 		description: "配置和管理飞书私聊连接",
 		handler: async (args, context) => {
 			latestCommandContext = context;
+			state.latestCommandContext = context;
 			try {
 				await handleFeishuCommand(parseFeishuCommand(args), state.controller, context);
 			} catch (error) {
@@ -289,6 +501,11 @@ function toModelInfo(model: PiModel): PiModelInfo {
 	return { id: model.id, name: model.name || model.id, provider: String(model.provider) };
 }
 
+function shouldAutoStartFeishu(environment: NodeJS.ProcessEnv): boolean {
+	const value = environment.PI_FEISHU_AUTO_START ?? environment.FEISHU_AUTO_START;
+	return value === "1" || value?.toLowerCase() === "true" || value?.toLowerCase() === "yes";
+}
+
 function isThinkingLevel(value: string): value is PiThinkingLevel {
 	return (THINKING_LEVELS as readonly string[]).includes(value);
 }
@@ -319,31 +536,53 @@ async function handleFeishuCommand(
 				throw new CredentialError("请先执行 /feishu stop，再修改飞书凭据。");
 			}
 			const credentials = await controller.setup(command.args, process.env);
-			context.ui.notify(`飞书凭据验证成功并已保存：${credentials.appId}`, "info");
+			context.ui.notify(`✅ 飞书凭据验证成功并已保存：${credentials.appId}`, "info");
+			// 对齐 easycodeclient：setup 成功后输出分步配置引导（一键申请权限/事件订阅/发布版本）。
+			context.ui.notify(renderPostSetupGuidance(credentials.appId), "info");
+			// 并自动拉起长连接，省去手动 /feishu start。
+			await handleFeishuCommand({ name: "start", args: "" }, controller, context);
 			return;
 		}
 		case "start": {
-			const result = await controller.start(process.env);
-			if (result.alreadyRunning) {
-				context.ui.notify("飞书长连接已经在运行。", "info");
+			// 对齐 easycodeclient：未配置凭据时给出可操作的配置指引，而非报错。
+			const precheck = await controller.status(process.env);
+			if (!precheck.configured) {
+				context.ui.notify(renderMissingCredentials(), "warning");
 				return;
 			}
-			if (result.bindingCode) {
-				context.ui.notify(
-					`飞书长连接已启动。\n一次性绑定码：${result.bindingCode}\n请在飞书私聊 Bot 发送：/bind ${result.bindingCode}`,
-					"warning",
-				);
-			} else {
-				context.ui.notify("飞书长连接已启动，Owner 已绑定。", "info");
+			const result = await controller.start(process.env);
+			if (result.alreadyRunning) {
+				context.ui.notify("⚠️ 飞书 Bot 已在运行中。输入 /feishu stop 停止后再启动。", "info");
+				return;
 			}
+			const postStart = await controller.status(process.env);
+			let dashboard = renderStartSuccess(postStart, result.bindingCode);
+			// 对齐 easycodeclient：start 后 probe 权限健康度，缺失时追加一键申请链接。
+			const appId = controller.appId;
+			if (appId) {
+				const probe = await controller.probeScopes();
+				dashboard = await appendScopeHealthHint(appId, dashboard, probe.grantedScopes);
+			}
+			context.ui.notify(dashboard, result.bindingCode ? "warning" : "info");
 			return;
 		}
 		case "stop":
-			context.ui.notify((await controller.stop()) ? "飞书长连接已停止。" : "飞书长连接未运行。", "info");
+			context.ui.notify((await controller.stop()) ? "✅ 飞书长连接已停止。" : "⚠️ 飞书 Bot 未运行。", "info");
 			return;
-		case "status":
-			context.ui.notify(renderFeishuStatus(await controller.status(process.env)), "info");
+		case "status": {
+			const status = await controller.status(process.env);
+			// ✨ Mini-doctor：probe scope 健康度（失败不影响 status 输出）。
+			let scopeHealth: string[] | undefined;
+			const appId = controller.appId;
+			if (status.configured && appId) {
+				const probe = await controller.probeScopes();
+				if (probe.grantedScopes) {
+					scopeHealth = missingScopes(probe.grantedScopes, REQUIRED_APP_SCOPES);
+				}
+			}
+			context.ui.notify(renderFeishuStatus(status, scopeHealth), "info");
 			return;
+		}
 		case "logout": {
 			if (context.hasUI) {
 				const confirmed = await context.ui.confirm("退出飞书", "停止连接并清除本地飞书凭据？");

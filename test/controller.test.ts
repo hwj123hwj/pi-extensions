@@ -40,6 +40,8 @@ class FakeGateway implements FeishuGateway {
 	nextId = 1;
 	nextReactionId = "reaction_1";
 	failReactions = false;
+	grantedScopes: string[] | undefined = [];
+	probeCalls = 0;
 	private handler: ((message: FeishuIncomingMessage) => Promise<void> | void) | undefined;
 	private reactionHandler: FeishuReactionHandler | undefined;
 
@@ -50,6 +52,11 @@ class FakeGateway implements FeishuGateway {
 
 	async createGroupChat(name: string, ownerOpenId: string): Promise<string> {
 		return `oc_${name}_${ownerOpenId}`;
+	}
+
+	async probeGrantedScopes(): Promise<{ grantedScopes?: string[] }> {
+		this.probeCalls += 1;
+		return this.grantedScopes ? { grantedScopes: this.grantedScopes } : {};
 	}
 
 	async disconnect(): Promise<void> {
@@ -136,6 +143,7 @@ class FakeReply {
 
 class FakeAgent implements AgentBridge {
 	calls: string[] = [];
+	runOptions: Array<{ chatId?: string } | undefined> = [];
 	cancelCalls = 0;
 	runImpl: (text: string) => Promise<string> = async (text) => `Pi: ${text}`;
 
@@ -145,8 +153,10 @@ class FakeAgent implements AgentBridge {
 			onText?: (value: string) => void;
 			onActivity?: (activity: { kind: string; toolName?: string }) => void;
 		},
+		options?: { chatId?: string },
 	): Promise<string> {
 		this.calls.push(text);
+		this.runOptions.push(options);
 		observer?.onActivity?.({ kind: "thinking" });
 		observer?.onText?.(`Pi: ${text}`);
 		return this.runImpl(text);
@@ -286,11 +296,15 @@ describe("FeishuController", () => {
 		const chatId = await controller.createGroupChat("Project");
 		expect(chatId).toBe("oc_Project_ou_owner");
 		expect(store.state?.managedGroupIds).toEqual([chatId]);
-		expect(gateway.sent.at(-1)?.chatId).toBe(chatId);
+		expect(gateway.sent.at(-2)?.chatId).toBe(chatId);
+		expect(gateway.sent.at(-2)?.text).toContain("@机器人");
+		expect(gateway.sent.at(-1)).toMatchObject({ chatId: "ou_owner" });
+		expect(gateway.sent.at(-1)?.text).toContain("免 @ 权限");
 
 		await gateway.emit(privateText({ messageId: "om_group", chatId, chatType: "group", text: "@bot hello" }));
 		await controller.waitForIdle();
 		expect(agent.calls).toEqual(["@bot hello"]);
+		expect(agent.runOptions).toEqual([{ chatId }]);
 
 		await gateway.emit(privateText({ messageId: "om_other_group", chatId: "oc_unmanaged", chatType: "group" }));
 		await controller.waitForIdle();

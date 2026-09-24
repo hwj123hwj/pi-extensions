@@ -67,6 +67,7 @@ export function resolveRuntimeCredentials(
 			appSecret,
 			...(matching?.ownerOpenId ? { ownerOpenId: matching.ownerOpenId } : {}),
 			...(matching?.managedGroupIds ? { managedGroupIds: matching.managedGroupIds } : {}),
+			...(matching?.groupSessions ? { groupSessions: matching.groupSessions } : {}),
 		};
 	}
 	return stored;
@@ -134,6 +135,7 @@ export class FileCredentialStore implements CredentialStore {
 			...(Array.isArray(value.managedGroupIds)
 				? { managedGroupIds: value.managedGroupIds.filter((id): id is string => typeof id === "string") }
 				: {}),
+			...(isStringRecord(value.groupSessions) ? { groupSessions: value.groupSessions } : {}),
 		};
 	}
 
@@ -170,8 +172,14 @@ function isCredentialRecord(value: unknown): value is FeishuCredentials {
 		typeof record.appId === "string" &&
 		typeof record.appSecret === "string" &&
 		(record.ownerOpenId === undefined || typeof record.ownerOpenId === "string") &&
-		(record.managedGroupIds === undefined || Array.isArray(record.managedGroupIds))
+		(record.managedGroupIds === undefined || Array.isArray(record.managedGroupIds)) &&
+		(record.groupSessions === undefined || isStringRecord(record.groupSessions))
 	);
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	return Object.values(value).every((entry) => typeof entry === "string");
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

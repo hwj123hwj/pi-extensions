@@ -8,10 +8,10 @@ interface PendingTurn {
 }
 
 export class PiAgentBridge implements AgentBridge {
-	private readonly sendUserMessage: (text: string) => void;
+	private readonly sendUserMessage: (text: string) => void | Promise<void>;
 	private pending: PendingTurn | undefined;
 
-	constructor(sendUserMessage: (text: string) => void) {
+	constructor(sendUserMessage: (text: string) => void | Promise<void>) {
 		this.sendUserMessage = sendUserMessage;
 	}
 
@@ -23,12 +23,10 @@ export class PiAgentBridge implements AgentBridge {
 		return new Promise<string>((resolve, reject) => {
 			this.pending = { resolve, reject, lastAssistantText: "", observer };
 			observer?.onActivity?.({ kind: "thinking" });
-			try {
-				this.sendUserMessage(text);
-			} catch (error) {
+			Promise.resolve(this.sendUserMessage(text)).catch((error: unknown) => {
 				this.pending = undefined;
 				reject(error instanceof Error ? error : new Error(String(error)));
-			}
+			});
 		});
 	}
 
