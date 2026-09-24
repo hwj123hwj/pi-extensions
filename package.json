@@ -31,7 +31,8 @@
 		"typecheck": "tsc --noEmit"
 	},
 	"dependencies": {
-		"@larksuiteoapi/node-sdk": "1.72.0"
+		"@larksuiteoapi/node-sdk": "1.72.0",
+		"typebox": "1.3.7"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "0.83.0"

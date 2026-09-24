@@ -2,6 +2,7 @@ export interface FeishuCredentials {
 	appId: string;
 	appSecret: string;
 	ownerOpenId?: string;
+	managedGroupIds?: string[];
 }
 
 export interface CredentialStore {
@@ -45,6 +46,7 @@ export interface FeishuReply {
 export interface FeishuGateway {
 	connect(handler: FeishuMessageHandler): Promise<void>;
 	disconnect(): Promise<void>;
+	createGroupChat(name: string, ownerOpenId: string): Promise<string>;
 	/** Sends text and resolves with the sent Feishu message id (for later recall). */
 	sendText(chatId: string, text: string, replyTo?: string): Promise<string | undefined>;
 	beginReply(chatId: string, replyTo: string): Promise<FeishuReply>;

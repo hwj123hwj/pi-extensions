@@ -48,6 +48,10 @@ class FakeGateway implements FeishuGateway {
 		this.handler = handler;
 	}
 
+	async createGroupChat(name: string, ownerOpenId: string): Promise<string> {
+		return `oc_${name}_${ownerOpenId}`;
+	}
+
 	async disconnect(): Promise<void> {
 		this.disconnectCalls += 1;
 		this.handler = undefined;
@@ -269,6 +273,28 @@ describe("FeishuController", () => {
 
 		await controller.stop();
 		expect(gateway.disconnectCalls).toBe(1);
+	});
+
+	it("creates a group for the bound Owner and processes only groups it manages", async () => {
+		const { store, gateway, agent, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		await controller.start({});
+
+		const chatId = await controller.createGroupChat("Project");
+		expect(chatId).toBe("oc_Project_ou_owner");
+		expect(store.state?.managedGroupIds).toEqual([chatId]);
+		expect(gateway.sent.at(-1)?.chatId).toBe(chatId);
+
+		await gateway.emit(privateText({ messageId: "om_group", chatId, chatType: "group", text: "@bot hello" }));
+		await controller.waitForIdle();
+		expect(agent.calls).toEqual(["@bot hello"]);
+
+		await gateway.emit(privateText({ messageId: "om_other_group", chatId: "oc_unmanaged", chatType: "group" }));
+		await controller.waitForIdle();
+		expect(agent.calls).toHaveLength(1);
 	});
 
 	it("binds one Owner, rejects other users, and ignores group or non-text messages", async () => {

@@ -61,8 +61,13 @@ export function resolveRuntimeCredentials(
 			throw new CredentialError("FEISHU_APP_ID 和 FEISHU_APP_SECRET 必须同时设置。");
 		}
 		validateCredentialShape({ appId, appSecret });
-		const ownerOpenId = stored?.appId === appId ? stored.ownerOpenId : undefined;
-		return ownerOpenId ? { appId, appSecret, ownerOpenId } : { appId, appSecret };
+		const matching = stored?.appId === appId ? stored : undefined;
+		return {
+			appId,
+			appSecret,
+			...(matching?.ownerOpenId ? { ownerOpenId: matching.ownerOpenId } : {}),
+			...(matching?.managedGroupIds ? { managedGroupIds: matching.managedGroupIds } : {}),
+		};
 	}
 	return stored;
 }
@@ -122,9 +127,14 @@ export class FileCredentialStore implements CredentialStore {
 			throw new CredentialError("飞书凭据文件格式无效，请执行 /feishu logout 后重新配置。");
 		}
 		validateCredentialShape(value);
-		return value.ownerOpenId
-			? { appId: value.appId, appSecret: value.appSecret, ownerOpenId: value.ownerOpenId }
-			: { appId: value.appId, appSecret: value.appSecret };
+		return {
+			appId: value.appId,
+			appSecret: value.appSecret,
+			...(value.ownerOpenId ? { ownerOpenId: value.ownerOpenId } : {}),
+			...(Array.isArray(value.managedGroupIds)
+				? { managedGroupIds: value.managedGroupIds.filter((id): id is string => typeof id === "string") }
+				: {}),
+		};
 	}
 
 	async save(credentials: FeishuCredentials): Promise<void> {
@@ -159,7 +169,8 @@ function isCredentialRecord(value: unknown): value is FeishuCredentials {
 	return (
 		typeof record.appId === "string" &&
 		typeof record.appSecret === "string" &&
-		(record.ownerOpenId === undefined || typeof record.ownerOpenId === "string")
+		(record.ownerOpenId === undefined || typeof record.ownerOpenId === "string") &&
+		(record.managedGroupIds === undefined || Array.isArray(record.managedGroupIds))
 	);
 }
 

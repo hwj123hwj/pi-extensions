@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import type { AgentBridge, FeishuStatus, PiModelInfo, PiRuntime, PiRuntimeSnapshot } from "./contracts.js";
 import { FeishuController } from "./controller.js";
 import { CredentialError, FileCredentialStore } from "./credentials.js";
@@ -211,6 +212,35 @@ export default function feishuExtension(pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => {
 		// 只解绑本会话的桥：长连接归全局 controller 保管，本地 /new 切换会话后自动延续。
 		bridge.cancel("Pi 会话已关闭。");
+	});
+
+	pi.registerTool({
+		name: "feishu_create_group",
+		label: "Create Feishu Group",
+		description:
+			"Create a Feishu group chat and invite the currently bound owner. Use when asked to 拉群、建群、创建飞书群 or create a group. This creates only the group (not a local project directory).",
+		parameters: Type.Object({
+			name: Type.String({ description: "Name for the new Feishu group chat" }),
+		}),
+		async execute(_toolCallId, params) {
+			try {
+				const chatId = await state.controller.createGroupChat(params.name.trim());
+				return {
+					content: [
+						{
+							type: "text",
+							text: `群聊「${params.name.trim()}」已创建，群聊 ID：${chatId}。已邀请当前绑定的飞书用户，并发送群欢迎消息。`,
+						},
+					],
+					details: { chatId, name: params.name.trim() },
+				};
+			} catch (error) {
+				return {
+					content: [{ type: "text", text: `创建飞书群失败：${state.controller.sanitizeError(error)}` }],
+					details: undefined,
+				};
+			}
+		},
 	});
 
 	pi.registerCommand("feishu", {

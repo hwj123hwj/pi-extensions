@@ -98,6 +98,31 @@ export class SdkFeishuGateway implements FeishuGateway {
 		return () => this.reactionHandlers.delete(handler);
 	}
 
+	async createGroupChat(name: string, ownerOpenId: string): Promise<string> {
+		const response = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ app_id: this.credentials.appId, app_secret: this.credentials.appSecret }),
+		});
+		const tokenResult = (await response.json()) as { code?: number; msg?: string; tenant_access_token?: string };
+		if (!response.ok || tokenResult.code !== 0 || !tokenResult.tenant_access_token) {
+			throw new Error(`获取飞书 tenant token 失败：${tokenResult.msg ?? response.statusText}`);
+		}
+		const createResponse = await fetch(`https://open.feishu.cn/open-apis/im/v1/chats?uuid=${crypto.randomUUID()}`, {
+			method: "POST",
+			headers: {
+				Authorization: `Bearer ${tokenResult.tenant_access_token}`,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ name, description: "Pi Feishu 创建的协作群", user_id_list: [ownerOpenId] }),
+		});
+		const result = (await createResponse.json()) as { code?: number; msg?: string; data?: { chat_id?: string } };
+		if (!createResponse.ok || result.code !== 0 || !result.data?.chat_id) {
+			throw new Error(`飞书创建群聊失败：${result.msg ?? createResponse.statusText}`);
+		}
+		return result.data.chat_id;
+	}
+
 	async sendText(chatId: string, text: string, replyTo?: string): Promise<string | undefined> {
 		const channel = this.channel;
 		if (!channel) throw new Error("飞书长连接尚未启动。");
@@ -164,6 +189,7 @@ function createOfficialChannel(credentials: FeishuCredentials): ChannelLike {
 			},
 			policy: {
 				dmMode: "open",
+				// Controller enforces owner identity and only accepts groups it created.
 				groupAllowlist: [],
 				requireMention: true,
 			},

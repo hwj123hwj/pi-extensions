@@ -64,6 +64,7 @@ export class FeishuController {
 	private environment: Environment = {};
 	private readonly pendingTasks = new Map<string, PendingTask>();
 	private readonly activeReplies = new Set<FeishuReply>();
+	private readonly managedGroupIds = new Set<string>();
 
 	constructor(options: FeishuControllerOptions) {
 		this.store = options.store;
@@ -84,9 +85,13 @@ export class FeishuController {
 		}
 
 		const existing = await this.store.load();
-		const next =
-			existing?.appId === credentials.appId && existing.ownerOpenId
-				? { ...credentials, ownerOpenId: existing.ownerOpenId }
+		const next: FeishuCredentials =
+			existing?.appId === credentials.appId
+				? {
+						...credentials,
+						...(existing.ownerOpenId ? { ownerOpenId: existing.ownerOpenId } : {}),
+						...(existing.managedGroupIds ? { managedGroupIds: existing.managedGroupIds } : {}),
+					}
 				: credentials;
 		await this.store.save(next);
 		this.credentials = next;
@@ -106,6 +111,8 @@ export class FeishuController {
 		const binding = new OwnerBinding(credentials.ownerOpenId, this.generateBindingCode);
 		const gateway = this.gatewayFactory(credentials);
 		this.credentials = credentials;
+		this.managedGroupIds.clear();
+		for (const chatId of credentials.managedGroupIds ?? []) this.managedGroupIds.add(chatId);
 		this.binding = binding;
 		this.gateway = gateway;
 		this.environment = environment;
@@ -123,6 +130,26 @@ export class FeishuController {
 
 		const bindingCode = binding.getOrCreateCode();
 		return bindingCode ? { alreadyRunning: false, bindingCode } : { alreadyRunning: false };
+	}
+
+	async createGroupChat(name: string): Promise<string> {
+		const gateway = this.gateway;
+		const ownerOpenId = this.credentials?.ownerOpenId;
+		if (!gateway) throw new CredentialError("飞书尚未连接，请先执行 /feishu start。");
+		if (!ownerOpenId) throw new CredentialError("飞书尚未绑定 Owner，无法创建群聊。");
+		const chatId = await gateway.createGroupChat(name, ownerOpenId);
+		this.managedGroupIds.add(chatId);
+		const credentials = this.credentials;
+		if (credentials) {
+			const updated = { ...credentials, managedGroupIds: [...this.managedGroupIds] };
+			await this.store.save(updated);
+			this.credentials = updated;
+		}
+		await gateway.sendText(
+			chatId,
+			`👋 群聊「${name}」已创建，当前绑定的 Pi 飞书机器人已就绪。直接在群内 @机器人即可开始协作。`,
+		);
+		return chatId;
 	}
 
 	async stop(): Promise<boolean> {
@@ -167,7 +194,8 @@ export class FeishuController {
 	async handleIncoming(message: FeishuIncomingMessage): Promise<void> {
 		const gateway = this.gateway;
 		const binding = this.binding;
-		if (!gateway || !binding || message.chatType !== "p2p" || message.contentType !== "text") return;
+		if (!gateway || !binding || message.contentType !== "text") return;
+		if (message.chatType === "group" && !this.managedGroupIds.has(message.chatId)) return;
 		if (!message.messageId || !this.deduplicator.accept(message.messageId)) return;
 
 		const reactionId = await this.ackRead(gateway, message.messageId);

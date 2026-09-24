@@ -8,6 +8,7 @@ import {
 	parseSetupArguments,
 	redactSensitiveText,
 	resolveCredentialInput,
+	resolveRuntimeCredentials,
 } from "../src/credentials.js";
 
 const temporaryDirectories: string[] = [];
@@ -56,21 +57,38 @@ describe("credential setup", () => {
 			appId: "cli_test",
 			appSecret: "secret-value",
 			ownerOpenId: "ou_owner",
+			managedGroupIds: ["oc_project"],
 		});
 
 		expect(await store.load()).toEqual({
 			appId: "cli_test",
 			appSecret: "secret-value",
 			ownerOpenId: "ou_owner",
+			managedGroupIds: ["oc_project"],
 		});
 		expect(JSON.parse(await readFile(path, "utf8"))).toEqual({
 			appId: "cli_test",
 			appSecret: "secret-value",
 			ownerOpenId: "ou_owner",
+			managedGroupIds: ["oc_project"],
 		});
 		if (process.platform !== "win32") {
 			expect((await stat(path)).mode & 0o777).toBe(0o600);
 		}
+	});
+
+	it("preserves managed groups when environment credentials override the stored secret", () => {
+		expect(
+			resolveRuntimeCredentials(
+				{ FEISHU_APP_ID: "cli_test", FEISHU_APP_SECRET: "new-secret" },
+				{ appId: "cli_test", appSecret: "old-secret", ownerOpenId: "ou_owner", managedGroupIds: ["oc_project"] },
+			),
+		).toEqual({
+			appId: "cli_test",
+			appSecret: "new-secret",
+			ownerOpenId: "ou_owner",
+			managedGroupIds: ["oc_project"],
+		});
 	});
 
 	it("redacts secrets from errors and logs", () => {
