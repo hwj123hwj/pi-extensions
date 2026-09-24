@@ -636,11 +636,21 @@ describe("FeishuController", () => {
 		await gateway.emit(privateText({ messageId: "om_third", text: "third" }));
 
 		// 非本人、非取消表情都不触发
-		gateway.emitReaction({ messageId: "om_third", operatorOpenId: "ou_other", emojiType: "CrossMark", action: "added" });
+		gateway.emitReaction({
+			messageId: "om_third",
+			operatorOpenId: "ou_other",
+			emojiType: "CrossMark",
+			action: "added",
+		});
 		gateway.emitReaction({ messageId: "om_third", operatorOpenId: "ou_owner", emojiType: "THINKING", action: "added" });
 		expect(gateway.recalled).not.toContain("om_sent_2");
 
-		gateway.emitReaction({ messageId: "om_second", operatorOpenId: "ou_owner", emojiType: "CrossMark", action: "added" });
+		gateway.emitReaction({
+			messageId: "om_second",
+			operatorOpenId: "ou_owner",
+			emojiType: "CrossMark",
+			action: "added",
+		});
 
 		expect(gateway.recalled).toContain("om_sent_1");
 		const cleared = gateway.removedReactions.map((entry) => entry.messageId);

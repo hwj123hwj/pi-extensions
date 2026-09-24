@@ -3,7 +3,6 @@ import type {
 	FeishuCredentials,
 	FeishuGateway,
 	FeishuMessageHandler,
-	FeishuReactionEvent,
 	FeishuReactionHandler,
 	FeishuReply,
 	FeishuReplySnapshot,
