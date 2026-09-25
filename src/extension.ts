@@ -1,10 +1,13 @@
+import { readFile, writeFile } from "node:fs/promises";
+import { resolve as resolvePath } from "node:path";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
-	ProjectTrustEventResult,
 	ProjectTrustHandler,
 } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import type { AgentBridge, FeishuStatus, PiModelInfo, PiRuntime, PiRuntimeSnapshot } from "./contracts.js";
 
 /** switchSession/withSession 回调里的新会话上下文；Pi 未从包根导出该类型名，从签名提取。 */
 type SwitchCallback = NonNullable<
@@ -14,9 +17,6 @@ type SwitchCallback = NonNullable<
 			: never
 		: never
 >;
-type WithSessionCallback = (ctx: SwitchCallback) => Promise<void>;
-import { Type } from "typebox";
-import type { AgentBridge, FeishuStatus, PiModelInfo, PiRuntime, PiRuntimeSnapshot } from "./contracts.js";
 import { FeishuController } from "./controller.js";
 import { CredentialError, FileCredentialStore } from "./credentials.js";
 import { SdkFeishuGateway, validateSdkCredentials } from "./gateway.js";
@@ -207,9 +207,17 @@ async function sendToChatSession(state: SharedFeishuState, chatId: string, promp
 	try {
 		const sessionFile = state.controller.getChatSessionFile(chatId);
 		if (sessionFile) {
-			const result = await switchWithDirectory(context, sessionFile, directory, (nextContext) =>
-				sendAndTrackGroupSession(state, chatId, sessionFile, nextContext, prompt),
-			);
+			// Pi 的 TUI switchSession 不透传 cwdOverride，改为把 cwd 写进会话头：
+			// SessionManager.open 切换时从 header 读取 cwd，runtime 随之在新目录重建。
+			if (directory && !(await anchorSessionHeaderCwd(sessionFile, directory))) {
+				throw new Error(`无法把群会话锚定到 ${directory}（会话文件不可写或格式未知）。`);
+			}
+			const result = await context.switchSession(sessionFile, {
+				withSession: (nextContext) => {
+					if (directory) assertAnchoredCwd(nextContext, directory);
+					return sendAndTrackGroupSession(state, chatId, sessionFile, nextContext, prompt);
+				},
+			});
 			if (result.cancelled) throw new Error("切换到飞书群绑定的 Pi 会话已取消。");
 			return;
 		}
@@ -219,11 +227,18 @@ async function sendToChatSession(state: SharedFeishuState, chatId: string, promp
 				state.latestCommandContext = nextContext;
 				const currentFile = nextContext.sessionManager.getSessionFile();
 				if (currentFile) await state.controller.setChatSessionFile(chatId, currentFile);
-				if (directory) {
-					// 新会话默认继承当前 cwd：显式重新锚定到绑定目录，再投递消息。
-					const anchored = await switchWithDirectory(nextContext, currentFile ?? "", directory, (finalContext) => {
-						state.latestCommandContext = finalContext;
-						return finalContext.sendUserMessage(prompt);
+				if (currentFile && directory) {
+					// 新会话默认继承当前 cwd：把会话头 cwd 改写为绑定目录后重新切换一次，
+					// runtime 会以新 cwd 重建，然后才投递消息。
+					if (!(await anchorSessionHeaderCwd(currentFile, directory))) {
+						throw new Error(`无法把群会话锚定到 ${directory}（会话文件不可写或格式未知）。`);
+					}
+					const anchored = await nextContext.switchSession(currentFile, {
+						withSession: (finalContext) => {
+							state.latestCommandContext = finalContext;
+							assertAnchoredCwd(finalContext, directory);
+							return finalContext.sendUserMessage(prompt);
+						},
 					});
 					if (anchored.cancelled) throw new Error("锚定群会话工作目录已取消。");
 					return;
@@ -238,36 +253,46 @@ async function sendToChatSession(state: SharedFeishuState, chatId: string, promp
 }
 
 /**
- * 切换会话并在切换完成后（含目录锚定）执行回调。
- * Pi 的命令上下文 d.ts 未声明 cwdOverride，但三种运行模式的 switchSession handler
- * 都会把 options 原样转发给 runtime，而 runtime 完整支持 override（切换后
- * createRuntime 直接使用 override 后的 cwd）。这里做一次窄化并在切换后校验
- * cwd 生效——若未来 Pi 改为丢弃该参数，会得到可操作的错误而不是静默串目录。
+ * 把会话文件头（JSONL 首行的 session header）里的 cwd 改写为绑定目录。
+ * 群会话空闲时文件不被任何 runtime 持有，重写首行是安全的；下次
+ * SessionManager.open 会以新 cwd 重建 runtime（工具、bash 都在新目录执行）。
+ * 返回 false 表示文件不可读/格式未知，调用方给出可操作错误。
  */
-async function switchWithDirectory(
-	context: ExtensionCommandContext,
-	sessionFile: string,
-	directory: string | undefined,
-	withSession: WithSessionCallback,
-): Promise<{ cancelled: boolean }> {
-	if (!directory) {
-		return context.switchSession(sessionFile, { withSession });
+export async function anchorSessionHeaderCwd(sessionFile: string, directory: string): Promise<boolean> {
+	let raw: string;
+	try {
+		raw = await readFile(sessionFile, "utf8");
+	} catch {
+		return false;
 	}
-	const options = { cwdOverride: directory, withSession };
-	const switcher = context.switchSession as unknown as (
-		path: string,
-		options: { cwdOverride: string; withSession: WithSessionCallback },
-	) => Promise<{ cancelled: boolean }>;
-	const result = await switcher.call(context, sessionFile, options);
-	if (!result.cancelled) {
-		const effectiveCwd = safeCwd(context);
-		if (effectiveCwd && effectiveCwd !== directory) {
-			throw new Error(
-				`群会话未能切换到绑定目录（当前：${effectiveCwd}）。请重启本地 Pi 后重试，或在本地执行 /feishu status 刷新会话控制。`,
-			);
-		}
+	const newlineIndex = raw.indexOf("\n");
+	const firstLine = newlineIndex === -1 ? raw : raw.slice(0, newlineIndex);
+	let header: Record<string, unknown>;
+	try {
+		header = JSON.parse(firstLine) as Record<string, unknown>;
+	} catch {
+		return false;
 	}
-	return result;
+	if (header.type !== "session" || typeof header.cwd !== "string") return false;
+	if (resolvePath(header.cwd) === resolvePath(directory)) return true;
+	header.cwd = directory;
+	const updatedFirstLine = JSON.stringify(header);
+	const updated = newlineIndex === -1 ? updatedFirstLine : updatedFirstLine + raw.slice(newlineIndex);
+	try {
+		await writeFile(sessionFile, updated, "utf8");
+	} catch {
+		return false;
+	}
+	return true;
+}
+
+function assertAnchoredCwd(context: ExtensionContext, directory: string): void {
+	const effective = safeCwd(context);
+	if (effective && resolvePath(effective) !== resolvePath(directory)) {
+		throw new Error(
+			`群会话未能切换到绑定目录（当前：${effective}）。请重启本地 Pi 后重试，或在本地执行 /feishu status 刷新会话控制。`,
+		);
+	}
 }
 
 function safeCwd(context: ExtensionContext): string | undefined {
