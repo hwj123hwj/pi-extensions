@@ -165,21 +165,50 @@ export function buildBotAddedGuidance(params: {
 	return lines.join("\n");
 }
 
+/** 每个 scope 的用途说明，用于欢迎语中的权限清单。 */
+export const SCOPE_DESCRIPTIONS: Record<string, string> = {
+	"im:message.p2p_msg:readonly": "接收私聊消息",
+	"im:message.group_at_msg:readonly": "接收群内 @机器人 的消息",
+	"im:message:send_as_bot": "以机器人身份发送/回复消息",
+	"im:message:update": "持续更新交互卡片（流式回复）",
+	"im:message.reactions:read": "读取表情回复（❌ 取消排队消息）",
+	"im:message.reactions:write_only": "添加表情回复（思考中已读回执）",
+	"im:chat": "创建群聊并邀请 Owner",
+	"im:chat:read": "读取群信息（群名等）",
+	"application:application:self_manage": "读取应用已开通权限，自动完成权限体检",
+	[SENSITIVE_GROUP_MSG_SCOPE]: "群内免 @ 直接响应所有消息（敏感权限，需人工审核）",
+};
+
+function renderScopeInventory(): string[] {
+	return [...REQUIRED_APP_SCOPES, SENSITIVE_GROUP_MSG_SCOPE].map((scope) => {
+		const description = SCOPE_DESCRIPTIONS[scope];
+		return description ? `- \`${scope}\`（${description}）` : `- \`${scope}\``;
+	});
+}
+
 /**
  * 权限体检段落：grantedScopes 未知时返回 null（不猜）；
- * 全部就绪时返回 ✅ 段落，否则返回缺失清单 + 一键申请链接。
+ * 全部就绪时返回 ✅ 段落 + 完整依赖清单（便于逐项核对），
+ * 否则返回缺失清单 + 一键申请链接。
  */
 export function buildScopeHealthSection(appId: string, grantedScopes?: readonly string[]): string | null {
 	if (!grantedScopes) return null;
 	const missing = missingScopes(grantedScopes, REQUIRED_APP_SCOPES);
 	const hasGroupMsg = hasScope(grantedScopes, SENSITIVE_GROUP_MSG_SCOPE);
 	if (missing.length === 0 && hasGroupMsg) {
-		return "✅ 应用权限配置完整，所有功能均可正常使用。";
+		return ["✅ 应用权限配置完整，所有功能均可正常使用。", "", "本 Bot 依赖以下权限（均已开通）：", ...renderScopeInventory()].join(
+			"\n",
+		);
 	}
 	const lines = ["⚠️ 以下应用权限尚未开通，对应功能会受限："];
 	if (missing.length > 0) {
 		lines.push(`📋 缺失 ${missing.length} 项基础权限，点击一键申请：`);
 		lines.push(`👉 ${buildScopeApplyUrl({ appId, scopes: missing })}`);
+		lines.push("   缺失明细：");
+		for (const scope of missing) {
+			const description = SCOPE_DESCRIPTIONS[scope];
+			lines.push(`   - \`${scope}\`${description ? `（${description}）` : ""}`);
+		}
 	}
 	if (!hasGroupMsg) {
 		lines.push("💬 「免 @ 响应」权限未开：群内需 @机器人 才能触发，点击开通：");
