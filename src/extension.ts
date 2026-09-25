@@ -100,8 +100,13 @@ function getSharedState(): SharedFeishuState {
 		steer: (text) => {
 			// 仅当确有飞书轮次在跑时并入：发到当前活跃会话（轮次就在那里），绝不触发会话切换。
 			if (!state.activeBridge || !state.sendCurrentMessage) return false;
-			state.sendCurrentMessage(text, { deliverAs: "steer" });
-			return true;
+			try {
+				state.sendCurrentMessage(text, { deliverAs: "steer" });
+				return true;
+			} catch {
+				// pi 已失效等场景：并入失败，回落到正常排队。
+				return false;
+			}
 		},
 	};
 	const proxyRuntime: PiRuntime = {
@@ -122,6 +127,8 @@ function getSharedState(): SharedFeishuState {
 					},
 				});
 				return !result.cancelled;
+			} catch (error) {
+				rethrowStaleAsHint(state, error);
 			} finally {
 				state.switchingSession = false;
 			}
@@ -165,6 +172,24 @@ function tryGetSessionFile(context: ExtensionContext): string | undefined {
 	}
 }
 
+/** 缓存的命令上下文已失效（Pi 侧发生过会话替换）时的可操作提示。 */
+export const SESSION_CONTROL_HINT =
+	"本地 Pi 会话控制已过期（本地发生过会话切换）。请在本地 Pi 执行一次 /feishu status 刷新，然后重发这条消息。";
+
+function isStaleCtxError(error: unknown): boolean {
+	const message = error instanceof Error ? error.message : String(error);
+	return message.includes("extension ctx is stale") || message.includes("ctx is stale after session replacement");
+}
+
+/** 把 Pi 的英文 stale 内部错误转译成可操作指引，其余错误原样上抛。 */
+function rethrowStaleAsHint(state: SharedFeishuState, error: unknown): never {
+	if (isStaleCtxError(error)) {
+		state.latestCommandContext = undefined;
+		throw new Error(SESSION_CONTROL_HINT);
+	}
+	throw error instanceof Error ? error : new Error(String(error));
+}
+
 /**
  * p2p 私聊消息永远落在主会话：群消息处理会把 Pi 切进群的会话，
  * 这里负责在下一条私聊到来时切回去，避免把 Owner 的提问发进群会话。
@@ -182,7 +207,7 @@ async function sendToMainSession(state: SharedFeishuState, prompt: string): Prom
 	const context = state.latestCommandContext;
 	if (!context) {
 		// 主会话与当前会话不一致却没有命令上下文：直发会串进群会话，给出可操作的错误更安全。
-		throw new Error("Pi 会话控制尚未就绪，请先在本地执行一次 /feishu status。");
+		throw new Error(SESSION_CONTROL_HINT);
 	}
 	state.switchingSession = true;
 	try {
@@ -193,19 +218,26 @@ async function sendToMainSession(state: SharedFeishuState, prompt: string): Prom
 			},
 		});
 		if (result.cancelled) throw new Error("切回主 Pi 会话已取消。");
+	} catch (error) {
+		rethrowStaleAsHint(state, error);
 	} finally {
 		state.switchingSession = false;
 	}
 }
 
 async function sendToChatSession(state: SharedFeishuState, chatId: string, prompt: string): Promise<void> {
+	const sessionFile = state.controller.getChatSessionFile(chatId);
+	// Pi 侧切换后当前会话可能恰好就是目标群会话：此时无需命令上下文，直接投递。
+	if (sessionFile && sessionFile === state.currentSessionFile && state.sendCurrentMessage) {
+		state.sendCurrentMessage(prompt);
+		return;
+	}
 	const context = state.latestCommandContext;
-	if (!context) throw new Error("Pi 会话控制尚未就绪，请先在本地执行一次 /feishu status。");
+	if (!context) throw new Error(SESSION_CONTROL_HINT);
 
 	const directory = state.controller.getChatDirectory(chatId);
 	state.switchingSession = true;
 	try {
-		const sessionFile = state.controller.getChatSessionFile(chatId);
 		if (sessionFile) {
 			// Pi 的 TUI switchSession 不透传 cwdOverride，改为把 cwd 写进会话头：
 			// SessionManager.open 切换时从 header 读取 cwd，runtime 随之在新目录重建。
@@ -247,6 +279,8 @@ async function sendToChatSession(state: SharedFeishuState, chatId: string, promp
 			},
 		});
 		if (result.cancelled) throw new Error("创建飞书群专属 Pi 会话已取消。");
+	} catch (error) {
+		rethrowStaleAsHint(state, error);
 	} finally {
 		state.switchingSession = false;
 	}
