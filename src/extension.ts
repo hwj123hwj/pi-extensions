@@ -30,6 +30,12 @@ interface SharedFeishuState {
 	activeBridge: PiAgentBridge | undefined;
 	latestCommandContext: ExtensionCommandContext | undefined;
 	sendCurrentMessage: ((text: string) => void) | undefined;
+	/** Pi 会话文件：p2p 私聊消息归属的主会话（绝不会是群绑定会话）。 */
+	mainSessionFile: string | undefined;
+	/** Pi 进程当前所在的会话文件，随每个事件刷新。 */
+	currentSessionFile: string | undefined;
+	/** 群绑定相关 switch/newSession 进行中的标记：期间出现的会话文件不得记为主会话。 */
+	bindingGroupChat: boolean;
 }
 
 const SHARED_STATE_KEY = "__piFeishuSharedState__";
@@ -49,6 +55,9 @@ function getSharedState(): SharedFeishuState {
 		activeBridge: undefined,
 		latestCommandContext: undefined,
 		sendCurrentMessage: undefined,
+		mainSessionFile: undefined,
+		currentSessionFile: undefined,
+		bindingGroupChat: false,
 		controller: undefined as unknown as FeishuController,
 	};
 	const proxyAgent: AgentBridge = {
@@ -58,9 +67,7 @@ function getSharedState(): SharedFeishuState {
 					await sendToChatSession(state, options.chatId, prompt);
 					return;
 				}
-				if (!state.current) throw new Error("Pi 会话尚未就绪，请稍后再试。");
-				if (!state.sendCurrentMessage) throw new Error("Pi 会话尚未就绪，请稍后再试。");
-				state.sendCurrentMessage(prompt);
+				await sendToMainSession(state, prompt);
 			});
 			state.activeBridge = bridge;
 			return bridge.run(text, observer).finally(() => {
@@ -74,6 +81,23 @@ function getSharedState(): SharedFeishuState {
 		abort: () => state.current?.runtime.abort(),
 		compact: () => state.current?.runtime.compact(),
 		newSession: () => state.current?.runtime.newSession() ?? Promise.resolve(false),
+		newChatSession: async (chatId) => {
+			const context = state.latestCommandContext;
+			if (!context) return false;
+			state.bindingGroupChat = true;
+			try {
+				const result = await context.newSession({
+					withSession: async (nextContext) => {
+						state.latestCommandContext = nextContext;
+						const sessionFile = nextContext.sessionManager.getSessionFile();
+						if (sessionFile) await state.controller.setChatSessionFile(chatId, sessionFile);
+					},
+				});
+				return !result.cancelled;
+			} finally {
+				state.bindingGroupChat = false;
+			}
+		},
 		setThinkingLevel: (level) => state.current?.runtime.setThinkingLevel(level) ?? Promise.resolve(false),
 		listModels: () => state.current?.runtime.listModels() ?? [],
 		switchModel: async (query) => {
@@ -94,33 +118,86 @@ function getSharedState(): SharedFeishuState {
 	return state;
 }
 
+/** 记录事件带来的会话文件：群绑定会话不记为主会话。 */
+function observeSessionFile(state: SharedFeishuState, context: ExtensionContext): void {
+	const file = tryGetSessionFile(context);
+	if (!file) return;
+	state.currentSessionFile = file;
+	if (state.bindingGroupChat) return;
+	if (state.controller.isGroupSessionFile(file)) return;
+	state.mainSessionFile = file;
+}
+
+function tryGetSessionFile(context: ExtensionContext): string | undefined {
+	try {
+		return context.sessionManager.getSessionFile();
+	} catch {
+		// 会话切换后捕获的 ctx 会失效，等下一个事件刷新即可。
+		return undefined;
+	}
+}
+
+/**
+ * p2p 私聊消息永远落在主会话：群消息处理会把 Pi 切进群的会话，
+ * 这里负责在下一条私聊到来时切回去，避免把 Owner 的提问发进群会话。
+ */
+async function sendToMainSession(state: SharedFeishuState, prompt: string): Promise<void> {
+	const main = state.mainSessionFile;
+	const current = state.currentSessionFile;
+	const ready = Boolean(state.current && state.sendCurrentMessage);
+	if (!main || !current || current === main || !ready) {
+		if (!state.current) throw new Error("Pi 会话尚未就绪，请稍后再试。");
+		if (!state.sendCurrentMessage) throw new Error("Pi 会话尚未就绪，请稍后再试。");
+		state.sendCurrentMessage(prompt);
+		return;
+	}
+	const context = state.latestCommandContext;
+	if (!context) {
+		// 主会话与当前会话不一致却没有命令上下文：直发会串进群会话，给出可操作的错误更安全。
+		throw new Error("Pi 会话控制尚未就绪，请先在本地执行一次 /feishu status。");
+	}
+	const result = await context.switchSession(main, {
+		withSession: async (nextContext) => {
+			state.latestCommandContext = nextContext;
+			await nextContext.sendUserMessage(prompt);
+		},
+	});
+	if (result.cancelled) throw new Error("切回主 Pi 会话已取消。");
+}
+
 async function sendToChatSession(state: SharedFeishuState, chatId: string, prompt: string): Promise<void> {
 	const context = state.latestCommandContext;
 	if (!context) throw new Error("Pi 会话控制尚未就绪，请先在本地执行一次 /feishu status。");
 
-	const sessionFile = state.controller.getChatSessionFile(chatId);
-	if (sessionFile) {
-		const result = await context.switchSession(sessionFile, {
+	state.bindingGroupChat = true;
+	try {
+		const sessionFile = state.controller.getChatSessionFile(chatId);
+		if (sessionFile) {
+			const result = await context.switchSession(sessionFile, {
+				withSession: async (nextContext) => {
+					state.latestCommandContext = nextContext;
+					const currentFile = nextContext.sessionManager.getSessionFile();
+					if (currentFile && currentFile !== sessionFile)
+						await state.controller.setChatSessionFile(chatId, currentFile);
+					await nextContext.sendUserMessage(prompt);
+				},
+			});
+			if (result.cancelled) throw new Error("切换到飞书群绑定的 Pi 会话已取消。");
+			return;
+		}
+
+		const result = await context.newSession({
 			withSession: async (nextContext) => {
 				state.latestCommandContext = nextContext;
 				const currentFile = nextContext.sessionManager.getSessionFile();
-				if (currentFile && currentFile !== sessionFile) await state.controller.setChatSessionFile(chatId, currentFile);
+				if (currentFile) await state.controller.setChatSessionFile(chatId, currentFile);
 				await nextContext.sendUserMessage(prompt);
 			},
 		});
-		if (result.cancelled) throw new Error("切换到飞书群绑定的 Pi 会话已取消。");
-		return;
+		if (result.cancelled) throw new Error("创建飞书群专属 Pi 会话已取消。");
+	} finally {
+		state.bindingGroupChat = false;
 	}
-
-	const result = await context.newSession({
-		withSession: async (nextContext) => {
-			state.latestCommandContext = nextContext;
-			const currentFile = nextContext.sessionManager.getSessionFile();
-			if (currentFile) await state.controller.setChatSessionFile(chatId, currentFile);
-			await nextContext.sendUserMessage(prompt);
-		},
-	});
-	if (result.cancelled) throw new Error("创建飞书群专属 Pi 会话已取消。");
 }
 
 export interface ParsedFeishuCommand {
@@ -220,10 +297,9 @@ export function renderPostSetupGuidance(appId: string, grantedScopes?: string[])
 		"  📡 第 2 步：在事件订阅页勾选必要事件",
 		`     👉 ${buildEventSubUrl(appId)}`,
 		"     需订阅事件：",
-		"       - im.message.receive_v1（接收消息）",
-		"       - im.message.recalled_v1（用户撤回消息 → 排队消息同步撤回）",
-		"       - im.chat.member.bot.added_v1（被拉入群通知）",
-		"       - card.action.trigger（卡片按钮回调）",
+		"       - im.message.receive_v1（接收私聊和群聊消息）",
+		"       - im.chat.member.bot.added_v1（被拉入群通知 → 私聊你发送绑定引导）",
+		"       - （可选）im.message.reactions 相关事件用于取消排队消息",
 		"",
 		"  🔄 第 3 步：申请发布版本",
 		"     在权限管理页申请版本发布，让 scope 生效：",
@@ -376,6 +452,10 @@ export default function feishuExtension(pi: ExtensionAPI): void {
 		if (!status.configured || status.running) return;
 		if (shouldAutoStartFeishu(process.env)) {
 			const result = await state.controller.start(process.env);
+			// 凭据就绪后复核主会话记录：启动时若恰好恢复在群绑定会话上，不能把它当成主会话。
+			if (state.mainSessionFile && state.controller.isGroupSessionFile(state.mainSessionFile)) {
+				state.mainSessionFile = undefined;
+			}
 			const dashboard = renderStartSuccess(await state.controller.status(process.env), result.bindingCode);
 			context.ui.notify(
 				dashboard.replace("🚀 飞书 Bot 已就绪！", "🚀 飞书插件已自动启动，Bot 已就绪！"),
@@ -392,6 +472,7 @@ export default function feishuExtension(pi: ExtensionAPI): void {
 	// 每个事件都会带来新的 ExtensionContext；持续刷新，保证远程命令拿到的能力不失效。
 	const trackContext = (_event: unknown, context: ExtensionContext): void => {
 		latestContext = context;
+		observeSessionFile(state, context);
 	};
 	pi.on("session_start", (event, context) => {
 		trackContext(event, context);
@@ -461,6 +542,10 @@ export default function feishuExtension(pi: ExtensionAPI): void {
 			state.latestCommandContext = context;
 			try {
 				await handleFeishuCommand(parseFeishuCommand(args), state.controller, context);
+				// 凭据就绪后复核主会话记录：启动时若记录发生在凭据加载之前，可能误记了群会话。
+				if (state.mainSessionFile && state.controller.isGroupSessionFile(state.mainSessionFile)) {
+					state.mainSessionFile = undefined;
+				}
 			} catch (error) {
 				context.ui.notify(`飞书操作失败：${state.controller.sanitizeError(error)}`, "error");
 			}

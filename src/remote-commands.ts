@@ -4,12 +4,16 @@ export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhig
 
 export const REMOTE_SLASH_COMMANDS: Record<string, string> = {
 	"/help": "显示远程命令帮助",
-	"/new": "新建 Pi 会话（丢弃当前对话上下文）",
+	"/new": "新建 Pi 会话（丢弃当前对话上下文；群聊中重置该群绑定的会话）",
 	"/stop": "中止当前任务，并跳过排队中的消息",
 	"/status": "查看飞书连接与 Pi 运行状态",
 	"/compact": "压缩当前会话上下文",
 	"/thinking": "查看或设置思考档位：/thinking [off|minimal|low|medium|high|xhigh|max]",
 	"/model": "查看当前模型，或切换：/model <模型ID或名称>",
+	"/bind": "（仅群聊）把当前群绑定到 Pi 并创建独立会话",
+	"/allow": "（仅 Owner）授权成员：/allow @成员；无参数时列出授权列表",
+	"/deny": "（仅 Owner）移除授权：/deny @成员",
+	"/allowlist": "（仅 Owner）查看当前授权成员",
 };
 
 export interface ParsedRemoteCommand {
@@ -22,6 +26,10 @@ export interface RemoteCommandContext {
 	status: () => Promise<FeishuStatus>;
 	/** Aborts queued messages after the current one; returns how many were skipped. */
 	stopQueue?: () => number;
+	/** Chat the command was sent from; group-scoped commands use it. */
+	chatId?: string;
+	/** Creates a fresh session for the chat-bound session of a group. */
+	newChatSession?: (chatId: string) => Promise<boolean>;
 }
 
 export function parseRemoteCommand(input: string): ParsedRemoteCommand | undefined {
@@ -66,7 +74,7 @@ export async function executeRemoteCommand(input: string, context: RemoteCommand
 		case "/compact":
 			return executeCompact(context.runtime);
 		case "/new":
-			return executeNewSession(context.runtime);
+			return executeNewSession(context);
 		case "/thinking":
 			return executeThinking(command.args, context.runtime);
 		case "/model":
@@ -92,7 +100,14 @@ function executeCompact(runtime: PiRuntime | undefined): string {
 	return "已开始压缩上下文，完成后继续对话即可。";
 }
 
-async function executeNewSession(runtime: PiRuntime | undefined): Promise<string> {
+async function executeNewSession(context: RemoteCommandContext): Promise<string> {
+	const { runtime } = context;
+	if (context.chatId && context.newChatSession) {
+		const created = await context.newChatSession(context.chatId);
+		return created
+			? "已为该群新建独立的 Pi 会话，接下来是一个全新的对话。"
+			: "新建会话未完成（本地已取消或暂不可用）。请先在本地 Pi 执行 /feishu 命令后重试。";
+	}
 	if (!runtime) return "远程新建会话暂不可用：请先在本地 Pi 执行任意 /feishu 命令，再通过飞书发送 /new。";
 	const created = await runtime.newSession();
 	return created

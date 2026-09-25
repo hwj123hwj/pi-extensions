@@ -5,12 +5,23 @@ export interface FeishuCredentials {
 	managedGroupIds?: string[];
 	/** Per managed group Pi session file. Missing value is backfilled on the group's first message. */
 	groupSessions?: Record<string, string>;
+	/** Open IDs allowed to drive the bot besides the Owner, e.g. teammates in a managed group. */
+	allowlist?: string[];
+	/** Display names for allowlisted open IDs, captured from @mentions when authorizing. */
+	allowlistNames?: Record<string, string>;
 }
 
 export interface CredentialStore {
 	load(): Promise<FeishuCredentials | null>;
 	save(credentials: FeishuCredentials): Promise<void>;
 	clear(): Promise<void>;
+}
+
+export interface FeishuMentionInfo {
+	key: string;
+	openId?: string;
+	name?: string;
+	isBot?: boolean;
 }
 
 export interface FeishuIncomingMessage {
@@ -20,9 +31,20 @@ export interface FeishuIncomingMessage {
 	senderOpenId: string;
 	contentType: string;
 	text: string;
+	/** Sender display name when the platform provides one. */
+	senderName?: string;
+	/** True when the message @-mentions this bot (group messages only). */
+	mentionedBot?: boolean;
+	/** All @mentions carried by the message, bot included. */
+	mentions?: FeishuMentionInfo[];
 }
 
 export type FeishuMessageHandler = (message: FeishuIncomingMessage) => Promise<void> | void;
+
+export interface FeishuBotAddedEvent {
+	chatId: string;
+	operatorOpenId: string;
+}
 
 export interface FeishuReactionEvent {
 	messageId: string;
@@ -41,7 +63,8 @@ export interface FeishuReplySnapshot {
 export interface FeishuReply {
 	update(snapshot: FeishuReplySnapshot): void;
 	complete(snapshot: FeishuReplySnapshot): Promise<void>;
-	fail(): Promise<void>;
+	/** Finalizes as failed; the sanitized reason is shown to the user when provided. */
+	fail(reason?: string): Promise<void>;
 	cancel(): Promise<void>;
 }
 
@@ -62,6 +85,10 @@ export interface FeishuGateway {
 	recallMessage(messageId: string): Promise<void>;
 	/** Subscribes to emoji reactions on messages visible to the bot. */
 	onReaction(handler: FeishuReactionHandler): () => void;
+	/** Subscribes to "bot added to chat" events. Optional: older gateways may not expose it. */
+	onBotAdded?(handler: (event: FeishuBotAddedEvent) => void): () => void;
+	/** Fetches basic chat metadata (e.g. group name) for guidance messages. Optional. */
+	getChatInfo?(chatId: string): Promise<{ name?: string } | undefined>;
 }
 
 export interface FeishuStatus {
@@ -97,6 +124,11 @@ export interface PiRuntime {
 	compact(): void;
 	/** Returns false when the runtime is unavailable or the switch was cancelled. */
 	newSession(): Promise<boolean>;
+	/**
+	 * Creates a new session for the chat-bound session of the given Feishu chat
+	 * and re-points the binding at it. Returns false when unavailable/cancelled.
+	 */
+	newChatSession?(chatId: string): Promise<boolean>;
 	/** Returns false when the requested thinking level does not exist. */
 	setThinkingLevel(level: string): Promise<boolean>;
 	/** Models the user can currently switch to. */

@@ -111,9 +111,56 @@ export function buildGroupPermissionReminder(params: {
 	lines.push(
 		"还需要确认事件订阅与发布：",
 		`1️⃣ 事件订阅页确认订阅 \`im.message.receive_v1\`：${buildEventSubUrl(params.appId)}`,
-		`2️⃣ 权限管理页申请发布版本使权限生效：${buildPermissionPageUrl(params.appId)}`,
+		`2️⃣ 权限管理页申请版本发布使权限生效：${buildPermissionPageUrl(params.appId)}`,
 		"",
 		"权限生效前，群里请先使用 `@机器人 你的问题`。",
 	);
+	return lines.join("\n");
+}
+
+/**
+ * Bot 被拉进一个未托管的新群时，私聊 Owner 的引导：
+ * 说明 /bind 用法，并附群聊相关权限的体检结果。
+ */
+export function buildBotAddedGuidance(params: {
+	groupName: string;
+	appId: string;
+	grantedScopes?: readonly string[];
+}): string {
+	const missingRequired = missingScopes(params.grantedScopes, [
+		"im:message.group_at_msg:readonly",
+		"im:message:send_as_bot",
+	]);
+	const missingGroupMsg = !hasScope(params.grantedScopes, SENSITIVE_GROUP_MSG_SCOPE);
+	const unknown = !params.grantedScopes;
+
+	const lines = [
+		"📥 **机器人已被加入新群聊**",
+		"",
+		`群聊「${params.groupName}」还没有绑定到 Pi。如需在该群使用，请在群里直接发送：`,
+		"",
+		"    /bind",
+		"",
+		"绑定后该群会获得独立的 Pi 会话，只有你和授权成员的消息会被处理。",
+		"",
+	];
+	if (unknown) {
+		lines.push("ℹ️ 暂时无法读取应用已开通的权限列表，无法自动完成权限体检。", "");
+	} else if (missingRequired.length > 0) {
+		lines.push(
+			"⚠️ 群聊基础权限缺失，群里 @机器人 可能收不到消息或无法回复：",
+			`   缺失：${missingRequired.join("、")}`,
+			`👉 一键申请：${buildScopeApplyUrl({ appId: params.appId, scopes: missingRequired })}`,
+			"",
+		);
+	}
+	if ((missingGroupMsg || unknown) && missingRequired.length === 0) {
+		lines.push(
+			`💬 该群暂未开通「免 @ 响应」权限（${SENSITIVE_GROUP_MSG_SCOPE}，敏感权限需人工审核）：群内请先 @机器人 触发。`,
+			`👉 一键申请：${buildScopeApplyUrl({ appId: params.appId, scopes: [SENSITIVE_GROUP_MSG_SCOPE] })}`,
+			"",
+		);
+	}
+	lines.push(`🔄 权限变更后需发布新版本生效：${buildPermissionPageUrl(params.appId)}`);
 	return lines.join("\n");
 }

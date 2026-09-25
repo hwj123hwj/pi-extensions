@@ -1,7 +1,9 @@
 import { createLarkChannel, type LarkChannel, LoggerLevel, type NormalizedMessage } from "@larksuiteoapi/node-sdk";
 import type {
+	FeishuBotAddedEvent,
 	FeishuCredentials,
 	FeishuGateway,
+	FeishuMentionInfo,
 	FeishuMessageHandler,
 	FeishuReactionHandler,
 	FeishuReply,
@@ -16,11 +18,15 @@ export interface NormalizedChannelMessage {
 	senderId: string;
 	content: string;
 	rawContentType: string;
+	senderName?: string;
+	mentionedBot?: boolean;
+	mentions?: FeishuMentionInfo[];
 }
 
 export interface ChannelLike {
 	onMessage(handler: (message: NormalizedChannelMessage) => Promise<void> | void): () => void;
 	onReaction(handler: FeishuReactionHandler): () => void;
+	onBotAdded(handler: (event: FeishuBotAddedEvent) => void): () => void;
 	connect(): Promise<void>;
 	disconnect(): Promise<void>;
 	/** Sends text and resolves with the sent Feishu message id (for later recall). */
@@ -30,6 +36,8 @@ export interface ChannelLike {
 	addReaction(messageId: string, emojiType: string): Promise<string>;
 	removeReaction(messageId: string, reactionId: string): Promise<void>;
 	recallMessage(messageId: string): Promise<void>;
+	/** Fetches chat metadata such as the group name. */
+	getChatInfo(chatId: string): Promise<{ name?: string } | undefined>;
 }
 
 export interface ChannelCardStream {
@@ -43,9 +51,11 @@ export class SdkFeishuGateway implements FeishuGateway {
 	private readonly credentials: FeishuCredentials;
 	private readonly channelFactory: ChannelFactory;
 	private readonly reactionHandlers = new Set<FeishuReactionHandler>();
+	private readonly botAddedHandlers = new Set<(event: FeishuBotAddedEvent) => void>();
 	private channel: ChannelLike | undefined;
 	private unsubscribe: (() => void) | undefined;
 	private reactionUnsubscribe: (() => void) | undefined;
+	private botAddedUnsubscribe: (() => void) | undefined;
 
 	constructor(credentials: FeishuCredentials, channelFactory: ChannelFactory = createOfficialChannel) {
 		this.credentials = credentials;
@@ -63,22 +73,31 @@ export class SdkFeishuGateway implements FeishuGateway {
 				senderOpenId: message.senderId,
 				contentType: message.rawContentType,
 				text: message.content,
+				...(message.senderName ? { senderName: message.senderName } : {}),
+				...(message.mentionedBot === undefined ? {} : { mentionedBot: message.mentionedBot }),
+				...(message.mentions ? { mentions: message.mentions } : {}),
 			}),
 		);
 		const reactionUnsubscribe = channel.onReaction((event) => {
 			for (const reactionHandler of this.reactionHandlers) reactionHandler(event);
 		});
+		const botAddedUnsubscribe = channel.onBotAdded((event) => {
+			for (const botAddedHandler of this.botAddedHandlers) botAddedHandler(event);
+		});
 		this.channel = channel;
 		this.unsubscribe = unsubscribe;
 		this.reactionUnsubscribe = reactionUnsubscribe;
+		this.botAddedUnsubscribe = botAddedUnsubscribe;
 		try {
 			await channel.connect();
 		} catch (error) {
 			this.channel = undefined;
 			this.unsubscribe = undefined;
 			this.reactionUnsubscribe = undefined;
+			this.botAddedUnsubscribe = undefined;
 			unsubscribe();
 			reactionUnsubscribe();
+			botAddedUnsubscribe();
 			await channel.disconnect().catch(() => undefined);
 			throw error;
 		}
@@ -91,6 +110,8 @@ export class SdkFeishuGateway implements FeishuGateway {
 		this.unsubscribe = undefined;
 		this.reactionUnsubscribe?.();
 		this.reactionUnsubscribe = undefined;
+		this.botAddedUnsubscribe?.();
+		this.botAddedUnsubscribe = undefined;
 		if (channel) await channel.disconnect();
 	}
 
@@ -99,20 +120,17 @@ export class SdkFeishuGateway implements FeishuGateway {
 		return () => this.reactionHandlers.delete(handler);
 	}
 
+	onBotAdded(handler: (event: FeishuBotAddedEvent) => void): () => void {
+		this.botAddedHandlers.add(handler);
+		return () => this.botAddedHandlers.delete(handler);
+	}
+
 	async createGroupChat(name: string, ownerOpenId: string): Promise<string> {
-		const response = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ app_id: this.credentials.appId, app_secret: this.credentials.appSecret }),
-		});
-		const tokenResult = (await response.json()) as { code?: number; msg?: string; tenant_access_token?: string };
-		if (!response.ok || tokenResult.code !== 0 || !tokenResult.tenant_access_token) {
-			throw new Error(`获取飞书 tenant token 失败：${tokenResult.msg ?? response.statusText}`);
-		}
+		const token = await fetchTenantAccessToken(this.credentials);
 		const createResponse = await fetch(`https://open.feishu.cn/open-apis/im/v1/chats?uuid=${crypto.randomUUID()}`, {
 			method: "POST",
 			headers: {
-				Authorization: `Bearer ${tokenResult.tenant_access_token}`,
+				Authorization: `Bearer ${token}`,
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify({ name, description: "Pi Feishu 创建的协作群", user_id_list: [ownerOpenId] }),
@@ -122,6 +140,12 @@ export class SdkFeishuGateway implements FeishuGateway {
 			throw new Error(`飞书创建群聊失败：${result.msg ?? createResponse.statusText}`);
 		}
 		return result.data.chat_id;
+	}
+
+	async getChatInfo(chatId: string): Promise<{ name?: string } | undefined> {
+		const channel = this.channel;
+		if (!channel) throw new Error("飞书长连接尚未启动。");
+		return channel.getChatInfo(chatId);
 	}
 
 	async probeGrantedScopes(): Promise<{ grantedScopes?: string[] }> {
@@ -179,6 +203,19 @@ export async function validateSdkCredentials(
 	}
 }
 
+async function fetchTenantAccessToken(credentials: FeishuCredentials): Promise<string> {
+	const response = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ app_id: credentials.appId, app_secret: credentials.appSecret }),
+	});
+	const result = (await response.json()) as { code?: number; msg?: string; tenant_access_token?: string };
+	if (!response.ok || result.code !== 0 || !result.tenant_access_token) {
+		throw new Error(`获取飞书 tenant token 失败：${result.msg ?? response.statusText}`);
+	}
+	return result.tenant_access_token;
+}
+
 function createOfficialChannel(credentials: FeishuCredentials): ChannelLike {
 	return new OfficialChannelAdapter(
 		createLarkChannel({
@@ -205,14 +242,17 @@ function createOfficialChannel(credentials: FeishuCredentials): ChannelLike {
 				chatQueue: { enabled: false },
 			},
 		}),
+		credentials,
 	);
 }
 
 class OfficialChannelAdapter implements ChannelLike {
 	private readonly channel: LarkChannel;
+	private readonly credentials: FeishuCredentials;
 
-	constructor(channel: LarkChannel) {
+	constructor(channel: LarkChannel, credentials: FeishuCredentials) {
 		this.channel = channel;
+		this.credentials = credentials;
 	}
 
 	onMessage(handler: (message: NormalizedChannelMessage) => Promise<void> | void): () => void {
@@ -227,6 +267,12 @@ class OfficialChannelAdapter implements ChannelLike {
 				emojiType: event.emojiType,
 				action: event.action,
 			}),
+		);
+	}
+
+	onBotAdded(handler: (event: FeishuBotAddedEvent) => void): () => void {
+		return this.channel.on("botAdded", (event) =>
+			handler({ chatId: event.chatId, operatorOpenId: event.operator.openId }),
 		);
 	}
 
@@ -257,6 +303,20 @@ class OfficialChannelAdapter implements ChannelLike {
 
 	async recallMessage(messageId: string): Promise<void> {
 		await this.channel.recallMessage(messageId);
+	}
+
+	async getChatInfo(chatId: string): Promise<{ name?: string } | undefined> {
+		const token = await fetchTenantAccessToken(this.credentials);
+		const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
+			headers: { Authorization: `Bearer ${token}` },
+		});
+		const result = (await response.json()) as {
+			code?: number;
+			msg?: string;
+			data?: { name?: string; description?: string };
+		};
+		if (!response.ok || result.code !== 0) return undefined;
+		return { ...(result.data?.name ? { name: result.data.name } : {}) };
 	}
 
 	async startCardStream(to: string, card: object, replyTo?: string): Promise<ChannelCardStream> {
@@ -346,11 +406,9 @@ class SdkFeishuReply implements FeishuReply {
 		await this.finish(snapshot, snapshot.text || "Pi 已完成处理，但没有返回文本内容。");
 	}
 
-	async fail(): Promise<void> {
-		await this.finish(
-			{ text: this.snapshot.text || "处理消息失败，请稍后再试。", status: "处理失败" },
-			"处理消息失败，请稍后再试。",
-		);
+	async fail(reason?: string): Promise<void> {
+		const suffix = reason ? `：${reason}` : "，请稍后再试。";
+		await this.finish({ text: this.snapshot.text || "处理消息失败", status: "处理失败" }, `处理消息失败${suffix}`);
 	}
 
 	async cancel(): Promise<void> {
@@ -412,5 +470,17 @@ function toChannelMessage(message: NormalizedMessage): NormalizedChannelMessage 
 		senderId: message.senderId,
 		content: message.content,
 		rawContentType: message.rawContentType,
+		...(message.senderName ? { senderName: message.senderName } : {}),
+		mentionedBot: message.mentionedBot,
+		mentions: message.mentions.map(toMentionInfo),
+	};
+}
+
+function toMentionInfo(mention: NormalizedMessage["mentions"][number]): FeishuMentionInfo {
+	return {
+		key: mention.key,
+		...(mention.openId ? { openId: mention.openId } : {}),
+		...(mention.name ? { name: mention.name } : {}),
+		...(mention.isBot === undefined ? {} : { isBot: mention.isBot }),
 	};
 }

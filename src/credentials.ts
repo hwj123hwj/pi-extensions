@@ -68,6 +68,8 @@ export function resolveRuntimeCredentials(
 			...(matching?.ownerOpenId ? { ownerOpenId: matching.ownerOpenId } : {}),
 			...(matching?.managedGroupIds ? { managedGroupIds: matching.managedGroupIds } : {}),
 			...(matching?.groupSessions ? { groupSessions: matching.groupSessions } : {}),
+			...(matching?.allowlist ? { allowlist: matching.allowlist } : {}),
+			...(matching?.allowlistNames ? { allowlistNames: matching.allowlistNames } : {}),
 		};
 	}
 	return stored;
@@ -100,6 +102,10 @@ export function errorMessage(error: unknown, credentials?: Pick<FeishuCredential
 
 export function defaultCredentialsPath(): string {
 	return join(homedir(), ".pi", "agent", "feishu", "credentials.json");
+}
+
+export function defaultProcessedMessagesPath(): string {
+	return join(homedir(), ".pi", "agent", "feishu", "processed-messages.json");
 }
 
 export class FileCredentialStore implements CredentialStore {
@@ -136,6 +142,10 @@ export class FileCredentialStore implements CredentialStore {
 				? { managedGroupIds: value.managedGroupIds.filter((id): id is string => typeof id === "string") }
 				: {}),
 			...(isStringRecord(value.groupSessions) ? { groupSessions: value.groupSessions } : {}),
+			...(Array.isArray(value.allowlist)
+				? { allowlist: value.allowlist.filter((id): id is string => typeof id === "string") }
+				: {}),
+			...(isStringRecord(value.allowlistNames) ? { allowlistNames: value.allowlistNames } : {}),
 		};
 	}
 
@@ -173,7 +183,9 @@ function isCredentialRecord(value: unknown): value is FeishuCredentials {
 		typeof record.appSecret === "string" &&
 		(record.ownerOpenId === undefined || typeof record.ownerOpenId === "string") &&
 		(record.managedGroupIds === undefined || Array.isArray(record.managedGroupIds)) &&
-		(record.groupSessions === undefined || isStringRecord(record.groupSessions))
+		(record.groupSessions === undefined || isStringRecord(record.groupSessions)) &&
+		(record.allowlist === undefined || Array.isArray(record.allowlist)) &&
+		(record.allowlistNames === undefined || isStringRecord(record.allowlistNames))
 	);
 }
 

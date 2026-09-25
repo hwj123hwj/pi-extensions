@@ -3,24 +3,38 @@ import type {
 	CredentialStore,
 	CredentialValidator,
 	Environment,
+	FeishuBotAddedEvent,
 	FeishuCredentials,
 	FeishuGateway,
 	FeishuGatewayFactory,
 	FeishuIncomingMessage,
+	FeishuMentionInfo,
 	FeishuReactionEvent,
 	FeishuReply,
 	FeishuStatus,
 	PiRuntime,
 } from "./contracts.js";
-import { CredentialError, errorMessage, resolveCredentialInput, resolveRuntimeCredentials } from "./credentials.js";
+import {
+	CredentialError,
+	defaultProcessedMessagesPath,
+	errorMessage,
+	resolveCredentialInput,
+	resolveRuntimeCredentials,
+} from "./credentials.js";
 import { MessageDeduplicator } from "./message-deduplicator.js";
 import { SerialMessageQueue } from "./message-queue.js";
 import { OwnerBinding } from "./owner-binding.js";
-import { executeRemoteCommand, parseRemoteCommand } from "./remote-commands.js";
-import { buildGroupPermissionReminder } from "./scopes.js";
+import { executeRemoteCommand, type ParsedRemoteCommand, parseRemoteCommand } from "./remote-commands.js";
+import { buildBotAddedGuidance, buildGroupPermissionReminder } from "./scopes.js";
 
 // 与 easycodeclient 的飞书集成一致：THINKING 表情兼作"已读 + 处理中"回执。
 const READ_REACTION_EMOJI = "THINKING";
+
+// 绑定码消息形如 /bind 123456；群聊中出现时拒绝绑定（防止群成员目击后劫持 Owner）。
+const BIND_CODE_PATTERN = /^\/bind\s+\d{6}$/;
+
+// 群/授权管理命令只允许 Owner 使用；allowlist 成员可用其余远程命令。
+const OWNER_ONLY_COMMANDS = new Set(["/bind", "/allow", "/deny", "/allowlist"]);
 
 interface PendingTask {
 	messageId: string;
@@ -36,6 +50,30 @@ function queueTipText(position: number): string {
 	return `⏳ 已收到，排队中（第 ${position} 位），将在当前任务完成后处理。`;
 }
 
+/**
+ * 对齐 easycodeclient 的群聊上下文注入：让模型知道这是群内谁在说话，
+ * 而不是把群消息当成凭空的提问。SDK 已把 @ 他人改写成「@名字」。
+ */
+export function buildAgentPrompt(message: FeishuIncomingMessage, text: string): string {
+	if (message.chatType !== "group") return text;
+	const who = message.senderName?.trim() || message.senderOpenId;
+	return `[飞书群聊] ${who}：${text}`;
+}
+
+/** 从 /allow、/deny 参数中解析目标成员：优先取消息里 @ 的人，其次接受 ou_ 开头的 open id。 */
+export function resolveAllowTarget(
+	args: string,
+	mentions: readonly FeishuMentionInfo[] | undefined,
+): { openId: string; name?: string } | undefined {
+	const mentioned = mentions?.find((entry) => !entry.isBot && entry.openId);
+	if (mentioned?.openId) {
+		return { openId: mentioned.openId, ...(mentioned.name ? { name: mentioned.name } : {}) };
+	}
+	const trimmed = args.trim();
+	if (/^ou_[A-Za-z0-9]+$/.test(trimmed)) return { openId: trimmed };
+	return undefined;
+}
+
 export interface FeishuControllerOptions {
 	store: CredentialStore;
 	gatewayFactory: FeishuGatewayFactory;
@@ -43,6 +81,8 @@ export interface FeishuControllerOptions {
 	agent: AgentBridge;
 	runtime?: PiRuntime;
 	generateBindingCode?: () => string;
+	/** 落盘去重记录的路径；默认与凭据同目录，测试注入临时路径。 */
+	deduplicationPath?: string;
 }
 
 export interface FeishuStartResult {
@@ -58,7 +98,7 @@ export class FeishuController {
 	private readonly runtime: PiRuntime | undefined;
 	private readonly generateBindingCode: (() => string) | undefined;
 	private readonly queue = new SerialMessageQueue();
-	private readonly deduplicator = new MessageDeduplicator();
+	private readonly deduplicator: MessageDeduplicator;
 	private gateway: FeishuGateway | undefined;
 	private credentials: FeishuCredentials | undefined;
 	private binding: OwnerBinding | undefined;
@@ -66,6 +106,7 @@ export class FeishuController {
 	private readonly pendingTasks = new Map<string, PendingTask>();
 	private readonly activeReplies = new Set<FeishuReply>();
 	private readonly managedGroupIds = new Set<string>();
+	private botAddedUnsubscribe: (() => void) | undefined;
 
 	constructor(options: FeishuControllerOptions) {
 		this.store = options.store;
@@ -74,6 +115,8 @@ export class FeishuController {
 		this.agent = options.agent;
 		this.runtime = options.runtime;
 		this.generateBindingCode = options.generateBindingCode;
+		// 对齐 easycodeclient：受理即落盘的去重记录，进程重启后飞书重推也不会重复执行。
+		this.deduplicator = new MessageDeduplicator(5000, options.deduplicationPath ?? defaultProcessedMessagesPath());
 	}
 
 	async setup(args: string, environment: Environment): Promise<FeishuCredentials> {
@@ -118,7 +161,8 @@ export class FeishuController {
 		this.binding = binding;
 		this.gateway = gateway;
 		this.environment = environment;
-		this.deduplicator.clear();
+		// 恢复落盘的受理记录：重启后飞书重推的事件仍会被去重，而不是重复驱动 Pi。
+		await this.deduplicator.hydrate();
 
 		try {
 			await gateway.connect((message) => this.handleIncoming(message));
@@ -129,6 +173,7 @@ export class FeishuController {
 			throw new CredentialError(`启动飞书长连接失败：${errorMessage(error, credentials)}`);
 		}
 		gateway.onReaction((event) => this.handleReaction(event));
+		this.botAddedUnsubscribe = gateway.onBotAdded?.((event) => void this.handleBotAdded(event));
 
 		const bindingCode = binding.getOrCreateCode();
 		return bindingCode ? { alreadyRunning: false, bindingCode } : { alreadyRunning: false };
@@ -141,12 +186,7 @@ export class FeishuController {
 		if (!ownerOpenId) throw new CredentialError("飞书尚未绑定 Owner，无法创建群聊。");
 		const chatId = await gateway.createGroupChat(name, ownerOpenId);
 		this.managedGroupIds.add(chatId);
-		const credentials = this.credentials;
-		if (credentials) {
-			const updated = { ...credentials, managedGroupIds: [...this.managedGroupIds] };
-			await this.store.save(updated);
-			this.credentials = updated;
-		}
+		await this.saveCredentials({ managedGroupIds: [...this.managedGroupIds] });
 		await gateway.sendText(
 			chatId,
 			`👋 群聊「${name}」已创建，当前绑定的 Pi 飞书机器人已就绪。直接在群内 @机器人即可开始协作。若群内普通消息没有响应，请先 @ 机器人；开通免 @ 权限后可直接发消息。`,
@@ -157,6 +197,13 @@ export class FeishuController {
 
 	getChatSessionFile(chatId: string): string | undefined {
 		return this.credentials?.groupSessions?.[chatId];
+	}
+
+	/** 判断会话文件是否属于某个群绑定会话；用于主会话追踪时排除群会话。 */
+	isGroupSessionFile(sessionFile: string): boolean {
+		const sessions = this.credentials?.groupSessions;
+		if (!sessions) return false;
+		return Object.values(sessions).includes(sessionFile);
 	}
 
 	async setChatSessionFile(chatId: string, sessionFile: string): Promise<void> {
@@ -195,6 +242,8 @@ export class FeishuController {
 	async stop(): Promise<boolean> {
 		const gateway = this.gateway;
 		if (!gateway) return false;
+		this.botAddedUnsubscribe?.();
+		this.botAddedUnsubscribe = undefined;
 		for (const entry of this.pendingTasks.values()) entry.cancelled = true;
 		this.pendingTasks.clear();
 		await Promise.all([...this.activeReplies].map((reply) => reply.cancel().catch(() => undefined)));
@@ -248,11 +297,17 @@ export class FeishuController {
 		const gateway = this.gateway;
 		const binding = this.binding;
 		if (!gateway || !binding || message.contentType !== "text") return;
-		if (message.chatType === "group" && !this.managedGroupIds.has(message.chatId)) return;
 		if (!message.messageId || !this.deduplicator.accept(message.messageId)) return;
+
+		// 未托管的群（Owner 没创建、也没 /bind 过）：只在被 @ 时给出引导，其余完全静默。
+		if (message.chatType === "group" && !this.managedGroupIds.has(message.chatId)) {
+			await this.handleUnmanagedGroupMessage(gateway, message);
+			return;
+		}
 
 		const reactionId = await this.ackRead(gateway, message.messageId);
 		const authorization = binding.authorize(message.senderOpenId, message.text);
+		let authorizedText: string | undefined;
 		switch (authorization.kind) {
 			case "binding-required":
 				await this.acknowledge(gateway, message, reactionId, "Bot 尚未绑定，请在本地 Pi 查看一次性绑定码。");
@@ -260,21 +315,275 @@ export class FeishuController {
 			case "invalid-binding-code":
 				await this.acknowledge(gateway, message, reactionId, "绑定码无效，请检查本地 Pi 显示的一次性绑定码。");
 				return;
-			case "unauthorized":
-				await this.acknowledge(gateway, message, reactionId, "未授权：此 Bot 仅响应已绑定的 Owner。");
-				return;
 			case "bound":
 				await this.persistOwner(authorization.ownerOpenId);
 				await this.acknowledge(gateway, message, reactionId, "绑定成功，现在可以直接发送问题。");
 				return;
-			case "authorized":
-				if (parseRemoteCommand(authorization.text)) {
-					// 斜杠命令快速通道：不进入消息队列，也不进入 LLM 上下文。
-					await this.runRemoteCommand(gateway, message, reactionId, authorization.text);
-					return;
+			case "unauthorized":
+				if (this.isAllowlisted(message.senderOpenId)) {
+					authorizedText = message.text;
+					break;
 				}
-				void this.enqueueAgentTask(gateway, message, authorization.text, reactionId);
+				// 对齐 easycodeclient 的分寸感：私聊或被 @ 时明确拒绝；群内普通消息保持隐形。
+				if (message.chatType === "p2p" || message.mentionedBot) {
+					await this.acknowledge(
+						gateway,
+						message,
+						reactionId,
+						"未授权：此 Bot 仅响应 Owner 与授权成员。Owner 可在私聊中发送 /allow @成员 添加授权。",
+					);
+				} else {
+					await this.clearRead(gateway, message.messageId, reactionId);
+				}
+				return;
+			case "authorized":
+				authorizedText = authorization.text;
 		}
+
+		// 对齐 easycodeclient 的安全模型：绑定码只能在私聊使用，防止群成员目击后劫持 Owner。
+		if (message.chatType === "group" && BIND_CODE_PATTERN.test(authorizedText.trim())) {
+			await this.acknowledge(gateway, message, reactionId, "出于安全考虑，一次性绑定码只能在私聊中使用。");
+			return;
+		}
+
+		const command = parseRemoteCommand(authorizedText);
+		if (command) {
+			if (OWNER_ONLY_COMMANDS.has(command.name) && message.senderOpenId !== binding.ownerOpenId) {
+				await this.acknowledge(gateway, message, reactionId, "该命令仅 Owner 可用。");
+				return;
+			}
+			if (await this.runManagedChatCommand(gateway, message, reactionId, command)) return;
+			await this.runRemoteCommand(gateway, message, reactionId, authorizedText);
+			return;
+		}
+		void this.enqueueAgentTask(gateway, message, authorizedText, reactionId);
+	}
+
+	private isAllowlisted(senderOpenId: string): boolean {
+		return this.credentials?.allowlist?.includes(senderOpenId) ?? false;
+	}
+
+	/** 未托管群：只有显式命令和 @bot 消息会得到回复，其余完全静默。 */
+	private async handleUnmanagedGroupMessage(gateway: FeishuGateway, message: FeishuIncomingMessage): Promise<void> {
+		// 群内出现绑定码：无论谁发、是否 @，都明确拒绝并提示去私聊，防劫持。
+		if (BIND_CODE_PATTERN.test(message.text.trim())) {
+			await gateway
+				.sendText(message.chatId, "出于安全考虑，一次性绑定码只能在私聊中使用。", message.messageId)
+				.catch(() => undefined);
+			return;
+		}
+		const ownerOpenId = this.binding?.ownerOpenId;
+		if (!ownerOpenId) return;
+		const command = parseRemoteCommand(message.text);
+		const isBindCommand = command?.name === "/bind" && !BIND_CODE_PATTERN.test(message.text.trim());
+		const isOwner = message.senderOpenId === ownerOpenId;
+		const isAllowed = isOwner || this.isAllowlisted(message.senderOpenId);
+		// 未被 @ 的普通闲聊保持隐形（免 @ 权限开通后尤其重要）。
+		if (!message.mentionedBot && !isBindCommand) return;
+
+		if (!isAllowed) {
+			await gateway
+				.sendText(
+					message.chatId,
+					isBindCommand
+						? "该命令仅 Owner 可用：请由 Owner 在群里发送 /bind 绑定本群。"
+						: "未授权：此 Bot 仅响应 Owner 与授权成员。请联系 Owner 在私聊中发送 /allow @你 添加授权。",
+					message.messageId,
+				)
+				.catch(() => undefined);
+			return;
+		}
+		if (isBindCommand) {
+			await this.bindManagedGroup(gateway, message);
+			return;
+		}
+		await gateway
+			.sendText(
+				message.chatId,
+				"本群还没有绑定到 Pi。Owner 在群里发送 /bind 即可绑定本群：之后群内消息会进入该群专属的独立 Pi 会话。",
+				message.messageId,
+			)
+			.catch(() => undefined);
+	}
+
+	/** 把当前群登记为受管群并持久化。 */
+	private async bindManagedGroup(gateway: FeishuGateway, message: FeishuIncomingMessage): Promise<void> {
+		if (this.managedGroupIds.has(message.chatId)) {
+			await gateway
+				.sendText(
+					message.chatId,
+					"本群已绑定到 Pi，直接 @机器人 即可提问（开通免 @ 权限后无需 @）。",
+					message.messageId,
+				)
+				.catch(() => undefined);
+			return;
+		}
+		this.managedGroupIds.add(message.chatId);
+		await this.saveCredentials({ managedGroupIds: [...this.managedGroupIds] });
+		await gateway
+			.sendText(
+				message.chatId,
+				"✅ 本群已绑定到 Pi。下一条群消息会自动创建该群专属的独立 Pi 会话；默认需要 @机器人 触发。",
+				message.messageId,
+			)
+			.catch(() => undefined);
+	}
+
+	/** Controller 自己处理的命令；返回 false 时回落到通用远程命令通道。 */
+	private async runManagedChatCommand(
+		gateway: FeishuGateway,
+		message: FeishuIncomingMessage,
+		reactionId: string,
+		command: ParsedRemoteCommand,
+	): Promise<boolean> {
+		switch (command.name) {
+			case "/bind":
+				await this.handleGroupBind(gateway, message, reactionId);
+				return true;
+			case "/allow":
+				await this.handleAllowChange(gateway, message, reactionId, command.args, true);
+				return true;
+			case "/deny":
+				await this.handleAllowChange(gateway, message, reactionId, command.args, false);
+				return true;
+			case "/allowlist":
+				await this.handleAllowlistShow(gateway, message, reactionId);
+				return true;
+			default:
+				return false;
+		}
+	}
+
+	private async handleGroupBind(
+		gateway: FeishuGateway,
+		message: FeishuIncomingMessage,
+		reactionId: string,
+	): Promise<void> {
+		if (message.chatType !== "group") {
+			await this.acknowledge(
+				gateway,
+				message,
+				reactionId,
+				"/bind 用于绑定群聊：请在需要使用的群里直接发送 /bind。私聊始终可用，无需绑定。",
+			);
+			return;
+		}
+		// 受管群走到这里说明已经绑定过；未托管群的 /bind 在未托管分支处理。
+		await this.acknowledge(
+			gateway,
+			message,
+			reactionId,
+			"本群已绑定到 Pi，直接 @机器人 即可提问（开通免 @ 权限后无需 @）。",
+		);
+	}
+
+	private async handleAllowChange(
+		gateway: FeishuGateway,
+		message: FeishuIncomingMessage,
+		reactionId: string,
+		args: string,
+		grant: boolean,
+	): Promise<void> {
+		const credentials = this.credentials;
+		const ownerOpenId = this.binding?.ownerOpenId;
+		if (!credentials || !ownerOpenId) return;
+		const target = resolveAllowTarget(args, message.mentions);
+		if (!target) {
+			await this.acknowledge(
+				gateway,
+				message,
+				reactionId,
+				grant ? "请 @ 要授权的成员，例如：/allow @张三。" : "请 @ 要移除授权的成员，例如：/deny @张三。",
+			);
+			return;
+		}
+		if (target.openId === ownerOpenId) {
+			await this.acknowledge(gateway, message, reactionId, "该成员已是 Owner，无需加入授权列表。");
+			return;
+		}
+		const allowlist = new Set(credentials.allowlist ?? []);
+		const names = { ...(credentials.allowlistNames ?? {}) };
+		const label = target.name ?? target.openId;
+		if (grant) {
+			if (allowlist.has(target.openId)) {
+				if (target.name) names[target.openId] = target.name;
+				await this.saveCredentials({ allowlistNames: names });
+				await this.acknowledge(gateway, message, reactionId, `${label} 已在授权列表中。`);
+				return;
+			}
+			allowlist.add(target.openId);
+			if (target.name) names[target.openId] = target.name;
+			await this.saveCredentials({ allowlist: [...allowlist], allowlistNames: names });
+			await this.acknowledge(
+				gateway,
+				message,
+				reactionId,
+				`✅ 已授权 ${label}，TA 现在可以在私聊和已绑定群中使用机器人。`,
+			);
+			return;
+		}
+		if (!allowlist.delete(target.openId)) {
+			await this.acknowledge(gateway, message, reactionId, `${label} 不在授权列表中。`);
+			return;
+		}
+		delete names[target.openId];
+		await this.saveCredentials({ allowlist: [...allowlist], allowlistNames: names });
+		await this.acknowledge(gateway, message, reactionId, `已移除授权：${label}。`);
+	}
+
+	private async handleAllowlistShow(
+		gateway: FeishuGateway,
+		message: FeishuIncomingMessage,
+		reactionId: string,
+	): Promise<void> {
+		const credentials = this.credentials;
+		if (!credentials) return;
+		const names = credentials.allowlistNames ?? {};
+		const entries = (credentials.allowlist ?? []).map((openId) =>
+			names[openId] ? `${names[openId]}（${openId}）` : openId,
+		);
+		const text =
+			entries.length > 0
+				? `当前授权成员：\n${entries.map((entry) => `- ${entry}`).join("\n")}`
+				: "当前没有授权成员，仅 Owner 可使用。可用 /allow @成员 添加。";
+		await this.acknowledge(gateway, message, reactionId, text);
+	}
+
+	/** 汇总受管群、授权列表等内存态并落盘。 */
+	private async saveCredentials(patch: Partial<FeishuCredentials>): Promise<void> {
+		const credentials = this.credentials;
+		if (!credentials) return;
+		const updated: FeishuCredentials = { ...credentials, ...patch };
+		await this.store.save(updated);
+		this.credentials = updated;
+	}
+
+	/** Bot 被拉进未托管的新群：私聊 Owner 发绑定引导 + 群聊权限体检。 */
+	private async handleBotAdded(event: FeishuBotAddedEvent): Promise<void> {
+		const gateway = this.gateway;
+		const credentials = this.credentials;
+		const ownerOpenId = this.binding?.ownerOpenId;
+		if (!gateway || !credentials || !ownerOpenId) return;
+		if (this.managedGroupIds.has(event.chatId)) return;
+
+		let groupName = "";
+		try {
+			groupName = (await gateway.getChatInfo?.(event.chatId))?.name ?? "";
+		} catch {
+			groupName = "";
+		}
+		let grantedScopes: string[] | undefined;
+		try {
+			grantedScopes = (await gateway.probeGrantedScopes?.())?.grantedScopes;
+		} catch {
+			grantedScopes = undefined;
+		}
+		const guidance = buildBotAddedGuidance({
+			groupName: groupName || "未命名群聊",
+			appId: credentials.appId,
+			...(grantedScopes ? { grantedScopes } : {}),
+		});
+		await gateway.sendText(ownerOpenId, guidance).catch(() => undefined);
 	}
 
 	private enqueueAgentTask(
@@ -409,7 +718,7 @@ export class FeishuController {
 		let latestText = "";
 		try {
 			const response = await this.agent.run(
-				text,
+				buildAgentPrompt(message, text),
 				{
 					onText: (latest) => {
 						latestText = latest;
@@ -431,12 +740,14 @@ export class FeishuController {
 					await gateway.sendText(message.chatId, response, message.messageId);
 				}
 			}
-		} catch {
+		} catch (error) {
 			if (this.gateway === gateway) {
+				// 把真实失败原因带回去（已脱敏），而不是笼统的"处理失败"。
+				const reason = this.sanitizeError(error);
 				if (reply) {
-					await reply.fail();
+					await reply.fail(reason);
 				} else {
-					await this.safeSend(gateway, message, "处理消息失败，请稍后再试。");
+					await this.safeSend(gateway, message, `处理消息失败：${reason}`);
 				}
 			}
 		} finally {
@@ -450,10 +761,13 @@ export class FeishuController {
 		reactionId: string,
 		text: string,
 	): Promise<void> {
+		const runtime = this.runtime;
 		const replyText = await executeRemoteCommand(text, {
-			runtime: this.runtime,
+			runtime,
 			status: () => this.status(this.environment),
 			stopQueue: () => this.stopQueuedMessages(gateway),
+			...(message.chatType === "group" ? { chatId: message.chatId } : {}),
+			...(runtime?.newChatSession ? { newChatSession: runtime.newChatSession.bind(runtime) } : {}),
 		}).catch((error: unknown) => `执行命令出错：${this.sanitizeError(error)}`);
 		await this.acknowledge(gateway, message, reactionId, replyText);
 	}

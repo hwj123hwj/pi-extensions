@@ -1,7 +1,11 @@
+import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type {
 	AgentBridge,
 	CredentialStore,
+	FeishuBotAddedEvent,
 	FeishuCredentials,
 	FeishuGateway,
 	FeishuIncomingMessage,
@@ -10,7 +14,7 @@ import type {
 	FeishuReplySnapshot,
 	PiRuntime,
 } from "../src/contracts.js";
-import { FeishuController } from "../src/controller.js";
+import { buildAgentPrompt, FeishuController, resolveAllowTarget } from "../src/controller.js";
 
 class MemoryCredentialStore implements CredentialStore {
 	state: FeishuCredentials | null = null;
@@ -42,8 +46,10 @@ class FakeGateway implements FeishuGateway {
 	failReactions = false;
 	grantedScopes: string[] | undefined = [];
 	probeCalls = 0;
+	chatInfo: Record<string, { name?: string }> = {};
 	private handler: ((message: FeishuIncomingMessage) => Promise<void> | void) | undefined;
 	private reactionHandler: FeishuReactionHandler | undefined;
+	private botAddedHandler: ((event: FeishuBotAddedEvent) => void) | undefined;
 
 	async connect(handler: (message: FeishuIncomingMessage) => Promise<void> | void): Promise<void> {
 		this.connectCalls += 1;
@@ -69,6 +75,21 @@ class FakeGateway implements FeishuGateway {
 		return () => {
 			this.reactionHandler = undefined;
 		};
+	}
+
+	onBotAdded(handler: (event: FeishuBotAddedEvent) => void): () => void {
+		this.botAddedHandler = handler;
+		return () => {
+			this.botAddedHandler = undefined;
+		};
+	}
+
+	emitBotAdded(event: FeishuBotAddedEvent): void {
+		this.botAddedHandler?.(event);
+	}
+
+	async getChatInfo(chatId: string): Promise<{ name?: string } | undefined> {
+		return this.chatInfo[chatId];
 	}
 
 	emitReaction(event: FeishuReactionEvent): void {
@@ -116,6 +137,7 @@ class FakeReply {
 	snapshots: FeishuReplySnapshot[] = [];
 	completed = false;
 	failed = false;
+	failReason: string | undefined;
 	cancelled = false;
 
 	constructor(
@@ -132,8 +154,9 @@ class FakeReply {
 		this.completed = true;
 	}
 
-	async fail(): Promise<void> {
+	async fail(reason?: string): Promise<void> {
 		this.failed = true;
+		this.failReason = reason;
 	}
 
 	async cancel(): Promise<void> {
@@ -230,7 +253,11 @@ function privateText(overrides: Partial<FeishuIncomingMessage> = {}): FeishuInco
 	};
 }
 
-function createFixture(initialCredentials: FeishuCredentials | null = null, runtime?: PiRuntime) {
+function createFixture(
+	initialCredentials: FeishuCredentials | null = null,
+	runtime?: PiRuntime,
+	deduplicationPath: string = join(tmpdir(), `pi-feishu-test-${randomUUID()}.json`),
+) {
 	const store = new MemoryCredentialStore();
 	store.state = initialCredentials;
 	const gateway = new FakeGateway();
@@ -241,6 +268,8 @@ function createFixture(initialCredentials: FeishuCredentials | null = null, runt
 		validateCredentials: async () => undefined,
 		agent,
 		generateBindingCode: () => "123456",
+		// 每个用例独立的去重落盘文件，既隔离用例，也让持久化行为可测。
+		deduplicationPath,
 		...(runtime ? { runtime } : {}),
 	});
 	return { store, gateway, agent, controller };
@@ -303,7 +332,7 @@ describe("FeishuController", () => {
 
 		await gateway.emit(privateText({ messageId: "om_group", chatId, chatType: "group", text: "@bot hello" }));
 		await controller.waitForIdle();
-		expect(agent.calls).toEqual(["@bot hello"]);
+		expect(agent.calls).toEqual([`[飞书群聊] ou_owner：@bot hello`]);
 		expect(agent.runOptions).toEqual([{ chatId }]);
 
 		await gateway.emit(privateText({ messageId: "om_other_group", chatId: "oc_unmanaged", chatType: "group" }));
@@ -705,5 +734,309 @@ describe("FeishuController", () => {
 		releases[1]?.();
 		await controller.waitForIdle();
 		expect(agent.calls).toEqual(["first", "third"]);
+	});
+
+	it("guides in unmanaged groups instead of staying silent, only when mentioned", async () => {
+		const { gateway, agent, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		await controller.start({});
+
+		// 未被 @ 的陌生群消息：完全静默
+		await gateway.emit(privateText({ messageId: "om_g1", chatId: "oc_free", chatType: "group", text: "普通闲聊" }));
+		expect(gateway.sent).toEqual([]);
+		expect(agent.calls).toEqual([]);
+
+		// 非 Owner 被 @：明确拒绝
+		await gateway.emit(
+			privateText({
+				messageId: "om_g2",
+				chatId: "oc_free",
+				chatType: "group",
+				senderOpenId: "ou_stranger",
+				text: "在吗",
+				mentionedBot: true,
+			}),
+		);
+		expect(gateway.sent.at(-1)?.chatId).toBe("oc_free");
+		expect(gateway.sent.at(-1)?.text).toContain("未授权");
+		expect(gateway.sent.at(-1)?.text).toContain("/allow");
+
+		// Owner 被 @：给出 /bind 绑定引导
+		await gateway.emit(
+			privateText({ messageId: "om_g3", chatId: "oc_free", chatType: "group", text: "@bot 你好", mentionedBot: true }),
+		);
+		expect(gateway.sent.at(-1)?.text).toContain("/bind");
+		expect(agent.calls).toEqual([]);
+	});
+
+	it("stays silent in unmanaged groups when the bot has no Owner yet", async () => {
+		const { gateway, agent, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+		});
+		await controller.start({});
+
+		await gateway.emit(
+			privateText({ messageId: "om_g1", chatId: "oc_free", chatType: "group", text: "@bot hi", mentionedBot: true }),
+		);
+		expect(gateway.sent).toEqual([]);
+		expect(agent.calls).toEqual([]);
+	});
+
+	it("binds an existing group via /bind from the Owner", async () => {
+		const { store, gateway, agent, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		await controller.start({});
+
+		await gateway.emit(privateText({ messageId: "om_bind", chatId: "oc_free", chatType: "group", text: "/bind" }));
+		expect(store.state?.managedGroupIds).toContain("oc_free");
+		expect(gateway.sent.at(-1)?.text).toContain("✅ 本群已绑定");
+
+		// 绑定后 Owner 的群消息进入独立群会话
+		await gateway.emit(
+			privateText({
+				messageId: "om_msg",
+				chatId: "oc_free",
+				chatType: "group",
+				text: "@bot 看下这个报错",
+				mentionedBot: true,
+			}),
+		);
+		await controller.waitForIdle();
+		expect(agent.calls).toEqual(["[飞书群聊] ou_owner：@bot 看下这个报错"]);
+		expect(agent.runOptions).toEqual([{ chatId: "oc_free" }]);
+
+		// 重复 /bind 幂等
+		await gateway.emit(privateText({ messageId: "om_bind2", chatId: "oc_free", chatType: "group", text: "/bind" }));
+		expect(gateway.sent.at(-1)?.text).toContain("已绑定");
+		expect(store.state?.managedGroupIds).toEqual(["oc_free"]);
+	});
+
+	it("rejects /bind from non-owners and binding codes inside groups", async () => {
+		const { gateway, agent, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		await controller.start({});
+
+		await gateway.emit(
+			privateText({
+				messageId: "om_bind",
+				chatId: "oc_free",
+				chatType: "group",
+				senderOpenId: "ou_stranger",
+				text: "/bind",
+				mentionedBot: true,
+			}),
+		);
+		expect(gateway.sent.at(-1)?.text).toContain("仅 Owner 可用");
+
+		// 群内出现绑定码：拒绝执行，防止群成员目击后劫持 Owner
+		await gateway.emit(
+			privateText({
+				messageId: "om_code",
+				chatId: "oc_free",
+				chatType: "group",
+				senderOpenId: "ou_owner",
+				text: "/bind 123456",
+			}),
+		);
+		expect(gateway.sent.at(-1)?.text).toContain("只能在私聊中使用");
+
+		// 私聊 /bind（无参数）给出用途说明
+		await gateway.emit(privateText({ messageId: "om_p2p", text: "/bind" }));
+		expect(gateway.sent.at(-1)?.text).toContain("请在需要使用的群里");
+
+		// 群绑定命令没有生效
+		expect(agent.calls).toEqual([]);
+	});
+
+	it("manages an allowlist and lets allowed members drive the bot", async () => {
+		const { store, gateway, agent, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		await controller.start({});
+
+		// Owner 通过 @ 成员授权
+		await gateway.emit(
+			privateText({
+				messageId: "om_allow",
+				text: "/allow @Bob",
+				mentions: [{ key: "@_user_1", openId: "ou_bob", name: "Bob" }],
+			}),
+		);
+		expect(store.state?.allowlist).toEqual(["ou_bob"]);
+		expect(store.state?.allowlistNames).toEqual({ ou_bob: "Bob" });
+		expect(gateway.sent.at(-1)?.text).toContain("已授权 Bob");
+
+		// 被授权成员私聊直接使用
+		await gateway.emit(privateText({ messageId: "om_bob", senderOpenId: "ou_bob", text: "hello from bob" }));
+		await controller.waitForIdle();
+		expect(agent.calls).toEqual(["hello from bob"]);
+
+		// 未被 @ 的非授权成员群消息静默
+		await gateway.emit(
+			privateText({
+				messageId: "om_stranger",
+				chatId: "oc_free",
+				chatType: "group",
+				senderOpenId: "ou_stranger",
+				text: "闲聊",
+			}),
+		);
+		expect(agent.calls).toEqual(["hello from bob"]);
+
+		// 查看列表
+		await gateway.emit(privateText({ messageId: "om_list", text: "/allowlist" }));
+		expect(gateway.sent.at(-1)?.text).toContain("Bob（ou_bob）");
+
+		// 移除授权后再发消息被拒
+		await gateway.emit(
+			privateText({
+				messageId: "om_deny",
+				text: "/deny @Bob",
+				mentions: [{ key: "@_user_1", openId: "ou_bob", name: "Bob" }],
+			}),
+		);
+		expect(gateway.sent.at(-1)?.text).toContain("已移除授权");
+		await gateway.emit(privateText({ messageId: "om_bob2", senderOpenId: "ou_bob", text: "hello again" }));
+		expect(gateway.sent.at(-1)?.text).toContain("未授权");
+		expect(agent.calls).toEqual(["hello from bob"]);
+	});
+
+	it("keeps allowlist management Owner-only for authorized members", async () => {
+		const { gateway, agent, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		await controller.start({});
+
+		// 先把该成员加入授权列表：TA 能用机器人，但不能管理授权。
+		await gateway.emit(
+			privateText({
+				messageId: "om_owner_allow",
+				text: "/allow @Stranger",
+				mentions: [{ key: "@_user_1", openId: "ou_stranger", name: "Stranger" }],
+			}),
+		);
+		await gateway.emit(
+			privateText({
+				messageId: "om_allow",
+				senderOpenId: "ou_stranger",
+				text: "/allow @Bob",
+				mentions: [{ key: "@_user_1", openId: "ou_bob", name: "Bob" }],
+			}),
+		);
+		expect(gateway.sent.at(-1)?.text).toContain("仅 Owner 可用");
+		expect(agent.calls).toEqual([]);
+	});
+
+	it("propagates the sanitized failure reason into the reply card", async () => {
+		const { gateway, agent, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		agent.runImpl = async () => {
+			throw new Error("Pi 会话控制尚未就绪，请先在本地执行一次 /feishu status。");
+		};
+		await controller.start({});
+
+		await gateway.emit(privateText({ messageId: "om_fail", text: "hello" }));
+		await controller.waitForIdle();
+
+		expect(gateway.replies[0]?.failed).toBe(true);
+		expect(gateway.replies[0]?.failReason).toContain("Pi 会话控制尚未就绪");
+	});
+
+	it("greets the Owner privately when the bot is added to an unmanaged group", async () => {
+		const { gateway, agent, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		await controller.start({});
+		gateway.chatInfo.oc_new = { name: "新项目群" };
+		gateway.grantedScopes = ["im:message.p2p_msg:readonly", "im:message:send_as_bot"];
+
+		gateway.emitBotAdded({ chatId: "oc_new", operatorOpenId: "ou_owner" });
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(gateway.sent.at(-1)?.chatId).toBe("ou_owner");
+		expect(gateway.sent.at(-1)?.text).toContain("新项目群");
+		expect(gateway.sent.at(-1)?.text).toContain("/bind");
+		expect(gateway.sent.at(-1)?.text).toContain("im:message.group_at_msg:readonly");
+		expect(agent.calls).toEqual([]);
+	});
+
+	it("keeps deduplication across controller restarts via the persisted receipt file", async () => {
+		const deduplicationPath = join(tmpdir(), `pi-feishu-test-${randomUUID()}.json`);
+		const { gateway, agent, controller } = createFixture(
+			{
+				appId: "cli_test",
+				appSecret: "secret",
+				ownerOpenId: "ou_owner",
+			},
+			undefined,
+			deduplicationPath,
+		);
+		await controller.start({});
+		await gateway.emit(privateText({ messageId: "om_once", text: "hello" }));
+		await controller.waitForIdle();
+		expect(agent.calls).toEqual(["hello"]);
+		await controller.stop();
+
+		// 新实例（模拟 Pi 重启）恢复落盘的受理记录：同一条消息不再重复执行。
+		const restartedAgent = new FakeAgent();
+		const restartedGateway = new FakeGateway();
+		const restarted = new FeishuController({
+			store: {
+				load: async () => ({ appId: "cli_test", appSecret: "secret", ownerOpenId: "ou_owner" }),
+				save: async () => undefined,
+				clear: async () => undefined,
+			},
+			gatewayFactory: () => restartedGateway,
+			validateCredentials: async () => undefined,
+			agent: restartedAgent,
+			deduplicationPath,
+		});
+		await restarted.start({});
+		await restartedGateway.emit(privateText({ messageId: "om_once", text: "hello" }));
+		await restarted.waitForIdle();
+		expect(restartedAgent.calls).toEqual([]);
+		await restarted.stop();
+	});
+
+	it("builds group prompts with the sender context and leaves private prompts untouched", () => {
+		expect(
+			buildAgentPrompt(
+				privateText({ chatType: "group", senderOpenId: "ou_alice", senderName: "Alice", text: "帮我看下" }),
+				"帮我看下",
+			),
+		).toBe("[飞书群聊] Alice：帮我看下");
+		expect(
+			buildAgentPrompt(privateText({ chatType: "group", senderOpenId: "ou_alice", text: "帮我看下" }), "帮我看下"),
+		).toBe("[飞书群聊] ou_alice：帮我看下");
+		expect(buildAgentPrompt(privateText({ text: "帮我看下" }), "帮我看下")).toBe("帮我看下");
+	});
+
+	it("resolves allow targets from mentions first and raw open ids second", () => {
+		expect(resolveAllowTarget("@Bob", [{ key: "@_user_1", openId: "ou_bob", name: "Bob" }])).toEqual({
+			openId: "ou_bob",
+			name: "Bob",
+		});
+		expect(resolveAllowTarget("ou_bob", undefined)).toEqual({ openId: "ou_bob" });
+		expect(resolveAllowTarget("@Bob", undefined)).toBeUndefined();
+		expect(resolveAllowTarget("", undefined)).toBeUndefined();
 	});
 });

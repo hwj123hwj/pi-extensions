@@ -21,11 +21,13 @@ class FakeChannel implements ChannelLike {
 	recalled: string[] = [];
 	edits: Array<{ messageId: string; text: string }> = [];
 	reactionEvents: FeishuReactionEvent[] = [];
+	chatInfo: Record<string, { name?: string }> = {};
 	nextId = 1;
 	nextReactionId = "reaction_1";
 	failReactions = false;
 	private messageHandler: ((message: NormalizedChannelMessage) => Promise<void> | void) | undefined;
 	private reactionHandler: FeishuReactionHandler | undefined;
+	private botAddedHandler: ((event: { chatId: string; operatorOpenId: string }) => void) | undefined;
 
 	onMessage(handler: (message: NormalizedChannelMessage) => Promise<void> | void): () => void {
 		this.messageHandler = handler;
@@ -91,6 +93,21 @@ class FakeChannel implements ChannelLike {
 		};
 	}
 
+	onBotAdded(handler: (event: { chatId: string; operatorOpenId: string }) => void): () => void {
+		this.botAddedHandler = handler;
+		return () => {
+			this.botAddedHandler = undefined;
+		};
+	}
+
+	emitBotAdded(event: { chatId: string; operatorOpenId: string }): void {
+		this.botAddedHandler?.(event);
+	}
+
+	async getChatInfo(chatId: string): Promise<{ name?: string } | undefined> {
+		return this.chatInfo[chatId];
+	}
+
 	async emit(message: NormalizedChannelMessage): Promise<void> {
 		await this.messageHandler?.(message);
 	}
@@ -132,6 +149,64 @@ describe("SdkFeishuGateway", () => {
 		expect(channel.sent).toEqual([{ to: "oc_1", text: "Pi response", replyTo: "om_1" }]);
 		await gateway.disconnect();
 		expect(channel.disconnectCalls).toBe(1);
+	});
+
+	it("passes group mention metadata through to the controller", async () => {
+		const channel = new FakeChannel();
+		const gateway = new SdkFeishuGateway({ appId: "cli_test", appSecret: "secret" }, createFactory(channel));
+		const received: FeishuIncomingMessage[] = [];
+
+		await gateway.connect((message) => {
+			received.push(message);
+		});
+		await channel.emit({
+			messageId: "om_2",
+			chatId: "oc_group",
+			chatType: "group",
+			senderId: "ou_alice",
+			content: "帮我看下这个报错",
+			rawContentType: "text",
+			senderName: "Alice",
+			mentionedBot: true,
+			mentions: [
+				{ key: "@_user_1", openId: "ou_bot", name: "Pi", isBot: true },
+				{ key: "@_user_2", openId: "ou_bob", name: "Bob" },
+			],
+		});
+
+		expect(received).toEqual([
+			{
+				messageId: "om_2",
+				chatId: "oc_group",
+				chatType: "group",
+				senderOpenId: "ou_alice",
+				contentType: "text",
+				text: "帮我看下这个报错",
+				senderName: "Alice",
+				mentionedBot: true,
+				mentions: [
+					{ key: "@_user_1", openId: "ou_bot", name: "Pi", isBot: true },
+					{ key: "@_user_2", openId: "ou_bob", name: "Bob" },
+				],
+			},
+		]);
+		await gateway.disconnect();
+	});
+
+	it("notifies bot-added subscribers and fetches chat info", async () => {
+		const channel = new FakeChannel();
+		const gateway = new SdkFeishuGateway({ appId: "cli_test", appSecret: "secret" }, createFactory(channel));
+		const added: Array<{ chatId: string; operatorOpenId: string }> = [];
+		gateway.onBotAdded((event) => added.push(event));
+
+		await gateway.connect(() => undefined);
+		channel.emitBotAdded({ chatId: "oc_new", operatorOpenId: "ou_inviter" });
+		channel.chatInfo.oc_new = { name: "项目群" };
+		await expect(gateway.getChatInfo("oc_new")).resolves.toEqual({ name: "项目群" });
+		await gateway.disconnect();
+		channel.emitBotAdded({ chatId: "oc_after", operatorOpenId: "ou_inviter" });
+
+		expect(added).toEqual([{ chatId: "oc_new", operatorOpenId: "ou_inviter" }]);
 	});
 
 	it("validates credentials by completing and closing a WebSocket handshake", async () => {
