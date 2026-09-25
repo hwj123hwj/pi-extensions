@@ -1,3 +1,5 @@
+import { stat } from "node:fs/promises";
+import { resolve } from "node:path";
 import type {
 	AgentBridge,
 	CredentialStore,
@@ -202,17 +204,36 @@ export class FeishuController {
 		await gateway.sendText(ownerOpenId, welcome).catch(() => undefined);
 	}
 
-	async createGroupChat(name: string): Promise<string> {
+	async createGroupChat(name: string, directory?: string): Promise<string> {
 		const gateway = this.gateway;
 		const ownerOpenId = this.credentials?.ownerOpenId;
 		if (!gateway) throw new CredentialError("飞书尚未连接，请先执行 /feishu start。");
 		if (!ownerOpenId) throw new CredentialError("飞书尚未绑定 Owner，无法创建群聊。");
 		const chatId = await gateway.createGroupChat(name, ownerOpenId);
 		this.managedGroupIds.add(chatId);
-		await this.saveCredentials({ managedGroupIds: [...this.managedGroupIds] });
+		let anchoredLine = "";
+		if (directory) {
+			const resolved = resolve(directory);
+			let isDirectory = false;
+			try {
+				isDirectory = (await stat(resolved)).isDirectory();
+			} catch {
+				isDirectory = false;
+			}
+			if (isDirectory) {
+				await this.saveCredentials({
+					managedGroupIds: [...this.managedGroupIds],
+					groupDirs: { ...(this.credentials?.groupDirs ?? {}), [chatId]: resolved },
+				});
+				anchoredLine = `\n📂 本群已锚定到目录：${resolved}`;
+			}
+		}
+		if (!this.credentials?.groupDirs?.[chatId]) {
+			await this.saveCredentials({ managedGroupIds: [...this.managedGroupIds] });
+		}
 		await gateway.sendText(
 			chatId,
-			`👋 群聊「${name}」已创建，当前绑定的 Pi 飞书机器人已就绪。直接在群内 @机器人即可开始协作。若群内普通消息没有响应，请先 @ 机器人；开通免 @ 权限后可直接发消息。`,
+			`👋 群聊「${name}」已创建，当前绑定的 Pi 飞书机器人已就绪。直接在群内 @机器人即可开始协作。若群内普通消息没有响应，请先 @ 机器人；开通免 @ 权限后可直接发消息。${anchoredLine}`,
 		);
 		await this.sendGroupPermissionReminder(gateway, ownerOpenId, name);
 		return chatId;
@@ -379,7 +400,35 @@ export class FeishuController {
 			await this.runRemoteCommand(gateway, message, reactionId, authorizedText);
 			return;
 		}
+		// 对齐 easycodeclient 的 mid-turn 注入：同聊天的追加消息直接并入正在运行的轮次，
+		// 不排队（跨聊天仍全局串行——Pi 是单会话进程）。
+		if (this.trySteerIntoRunningTurn(gateway, message, reactionId, authorizedText)) return;
 		void this.enqueueAgentTask(gateway, message, authorizedText, reactionId);
+	}
+
+	/** 同聊天已有任务在跑时，把新消息并入该轮次；返回是否成功并入。 */
+	private trySteerIntoRunningTurn(
+		gateway: FeishuGateway,
+		message: FeishuIncomingMessage,
+		reactionId: string,
+		text: string,
+	): boolean {
+		const runningTask = [...this.pendingTasks.values()].find(
+			(entry) => entry.started && !entry.cancelled && entry.chatId === message.chatId,
+		);
+		if (!runningTask) return false;
+		const steered = this.agent.steer?.(buildAgentPrompt(message, text)) ?? false;
+		if (!steered) return false;
+		// 并入后由运行中的任务统一回复；清掉本条消息的已读表情，改用文字确认。
+		void this.clearRead(gateway, message.messageId, reactionId);
+		void gateway
+			.sendText(
+				message.chatId,
+				"✅ 已收到，已并入当前正在处理的对话；回复会更新在上面的回复卡片里。",
+				message.messageId,
+			)
+			.catch(() => undefined);
+		return true;
 	}
 
 	private isAllowlisted(senderOpenId: string): boolean {
@@ -423,19 +472,28 @@ export class FeishuController {
 		await gateway
 			.sendText(
 				message.chatId,
-				"本群还没有绑定到 Pi。Owner 在群里发送 /bind 即可绑定本群：之后群内消息会进入该群专属的独立 Pi 会话。",
+				"本群还没有绑定到 Pi。Owner 在群里发送 /bind 即可绑定本群；也可带目录把群锚定到项目：/bind /path/to/project。",
 				message.messageId,
 			)
 			.catch(() => undefined);
 	}
 
-	/** 把当前群登记为受管群并持久化。 */
+	/** 把当前群登记为受管群并持久化；可同时绑定工作目录（对齐 easycodeclient 的 /bind <路径>）。 */
 	private async bindManagedGroup(gateway: FeishuGateway, message: FeishuIncomingMessage): Promise<void> {
+		const command = parseRemoteCommand(message.text);
+		const dirArg = command?.args.trim();
+		if (dirArg) {
+			await this.bindGroupDirectory(gateway, message, dirArg);
+			return;
+		}
 		if (this.managedGroupIds.has(message.chatId)) {
+			const dir = this.getChatDirectory(message.chatId);
 			await gateway
 				.sendText(
 					message.chatId,
-					"本群已绑定到 Pi，直接 @机器人 即可提问（开通免 @ 权限后无需 @）。",
+					dir
+						? `本群已绑定到 Pi（工作目录：${dir}）。直接 @机器人 即可提问（开通免 @ 权限后无需 @）。`
+						: "本群已绑定到 Pi，直接 @机器人 即可提问（开通免 @ 权限后无需 @）。\n如需把本群锚定到项目目录，发送：/bind /path/to/project",
 					message.messageId,
 				)
 				.catch(() => undefined);
@@ -446,10 +504,53 @@ export class FeishuController {
 		await gateway
 			.sendText(
 				message.chatId,
-				"✅ 本群已绑定到 Pi。下一条群消息会自动创建该群专属的独立 Pi 会话；默认需要 @机器人 触发。",
+				"✅ 本群已绑定到 Pi。下一条群消息会自动创建该群专属的独立 Pi 会话；默认需要 @机器人 触发。\n💡 如需让本群在指定项目目录下工作，发送：/bind /path/to/project",
 				message.messageId,
 			)
 			.catch(() => undefined);
+	}
+
+	/** /bind <目录>：校验目录存在后，把群锚定到该目录（工作目录在会话切换时生效）。 */
+	private async bindGroupDirectory(
+		gateway: FeishuGateway,
+		message: FeishuIncomingMessage,
+		dirArg: string,
+	): Promise<void> {
+		const resolved = resolve(dirArg);
+		let isDirectory = false;
+		try {
+			isDirectory = (await stat(resolved)).isDirectory();
+		} catch {
+			isDirectory = false;
+		}
+		if (!isDirectory) {
+			await gateway
+				.sendText(message.chatId, `❌ 目录不存在或不是文件夹：${resolved}\n用法：/bind /path/to/project`, message.messageId)
+				.catch(() => undefined);
+			return;
+		}
+		this.managedGroupIds.add(message.chatId);
+		await this.saveCredentials({
+			managedGroupIds: [...this.managedGroupIds],
+			groupDirs: { ...(this.credentials?.groupDirs ?? {}), [message.chatId]: resolved },
+		});
+		await gateway
+			.sendText(
+				message.chatId,
+				`✅ 本群已锚定到目录：${resolved}\n下一条群消息会在该目录下的独立 Pi 会话中处理（已有会话也会切换工作目录）。`,
+				message.messageId,
+			)
+			.catch(() => undefined);
+	}
+
+	/** 群绑定的项目目录；未绑定的群返回 undefined（沿用当前 cwd）。 */
+	getChatDirectory(chatId: string): string | undefined {
+		return this.credentials?.groupDirs?.[chatId];
+	}
+
+	/** 所有已绑定的群目录（用于 project trust 自动放行）。 */
+	getBoundDirectories(): string[] {
+		return Object.values(this.credentials?.groupDirs ?? {});
 	}
 
 	/** Controller 自己处理的命令；返回 false 时回落到通用远程命令通道。 */

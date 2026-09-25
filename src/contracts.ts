@@ -9,6 +9,8 @@ export interface FeishuCredentials {
 	allowlist?: string[];
 	/** Display names for allowlisted open IDs, captured from @mentions when authorizing. */
 	allowlistNames?: Record<string, string>;
+	/** Per managed group working directory (easycodeclient-style project binding). */
+	groupDirs?: Record<string, string>;
 }
 
 export interface CredentialStore {
@@ -153,6 +155,11 @@ export interface AgentRunOptions {
 export interface AgentBridge {
 	run(text: string, observer?: AgentProgressObserver, options?: AgentRunOptions): Promise<string>;
 	cancel(reason?: string): void;
+	/**
+	 * 并入当前正在运行的轮次（同聊天追加消息时使用）。
+	 * 仅当确有轮次在跑时返回 true；false 表示当前空闲，调用方应回退到正常排队。
+	 */
+	steer?(text: string): boolean;
 }
 
 export type FeishuGatewayFactory = (credentials: FeishuCredentials) => FeishuGateway;

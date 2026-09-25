@@ -70,6 +70,7 @@ export function resolveRuntimeCredentials(
 			...(matching?.groupSessions ? { groupSessions: matching.groupSessions } : {}),
 			...(matching?.allowlist ? { allowlist: matching.allowlist } : {}),
 			...(matching?.allowlistNames ? { allowlistNames: matching.allowlistNames } : {}),
+			...(matching?.groupDirs ? { groupDirs: matching.groupDirs } : {}),
 		};
 	}
 	return stored;
@@ -146,6 +147,7 @@ export class FileCredentialStore implements CredentialStore {
 				? { allowlist: value.allowlist.filter((id): id is string => typeof id === "string") }
 				: {}),
 			...(isStringRecord(value.allowlistNames) ? { allowlistNames: value.allowlistNames } : {}),
+			...(isStringRecord(value.groupDirs) ? { groupDirs: value.groupDirs } : {}),
 		};
 	}
 
@@ -185,7 +187,8 @@ function isCredentialRecord(value: unknown): value is FeishuCredentials {
 		(record.managedGroupIds === undefined || Array.isArray(record.managedGroupIds)) &&
 		(record.groupSessions === undefined || isStringRecord(record.groupSessions)) &&
 		(record.allowlist === undefined || Array.isArray(record.allowlist)) &&
-		(record.allowlistNames === undefined || isStringRecord(record.allowlistNames))
+		(record.allowlistNames === undefined || isStringRecord(record.allowlistNames)) &&
+		(record.groupDirs === undefined || isStringRecord(record.groupDirs))
 	);
 }
 

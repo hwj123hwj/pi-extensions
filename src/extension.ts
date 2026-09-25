@@ -1,4 +1,20 @@
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
+	ProjectTrustEventResult,
+	ProjectTrustHandler,
+} from "@earendil-works/pi-coding-agent";
+
+/** switchSession/withSession 回调里的新会话上下文；Pi 未从包根导出该类型名，从签名提取。 */
+type SwitchCallback = NonNullable<
+	Parameters<ExtensionCommandContext["switchSession"]>[1] extends infer O | undefined
+		? O extends { withSession?: (ctx: infer C) => unknown }
+			? C
+			: never
+		: never
+>;
+type WithSessionCallback = (ctx: SwitchCallback) => Promise<void>;
 import { Type } from "typebox";
 import type { AgentBridge, FeishuStatus, PiModelInfo, PiRuntime, PiRuntimeSnapshot } from "./contracts.js";
 import { FeishuController } from "./controller.js";
@@ -30,7 +46,7 @@ interface SharedFeishuState {
 	current: SessionLink | undefined;
 	activeBridge: PiAgentBridge | undefined;
 	latestCommandContext: ExtensionCommandContext | undefined;
-	sendCurrentMessage: ((text: string) => void) | undefined;
+	sendCurrentMessage: ((text: string, options?: { deliverAs?: "steer" | "followUp" }) => void) | undefined;
 	/** Pi 会话文件：p2p 私聊消息归属的主会话（绝不会是群绑定会话）。 */
 	mainSessionFile: string | undefined;
 	/** Pi 进程当前所在的会话文件，随每个事件刷新。 */
@@ -81,6 +97,12 @@ function getSharedState(): SharedFeishuState {
 			});
 		},
 		cancel: (reason) => state.activeBridge?.cancel(reason),
+		steer: (text) => {
+			// 仅当确有飞书轮次在跑时并入：发到当前活跃会话（轮次就在那里），绝不触发会话切换。
+			if (!state.activeBridge || !state.sendCurrentMessage) return false;
+			state.sendCurrentMessage(text, { deliverAs: "steer" });
+			return true;
+		},
 	};
 	const proxyRuntime: PiRuntime = {
 		isIdle: () => state.current?.runtime.isIdle() ?? true,
@@ -180,19 +202,14 @@ async function sendToChatSession(state: SharedFeishuState, chatId: string, promp
 	const context = state.latestCommandContext;
 	if (!context) throw new Error("Pi 会话控制尚未就绪，请先在本地执行一次 /feishu status。");
 
+	const directory = state.controller.getChatDirectory(chatId);
 	state.switchingSession = true;
 	try {
 		const sessionFile = state.controller.getChatSessionFile(chatId);
 		if (sessionFile) {
-			const result = await context.switchSession(sessionFile, {
-				withSession: async (nextContext) => {
-					state.latestCommandContext = nextContext;
-					const currentFile = nextContext.sessionManager.getSessionFile();
-					if (currentFile && currentFile !== sessionFile)
-						await state.controller.setChatSessionFile(chatId, currentFile);
-					await nextContext.sendUserMessage(prompt);
-				},
-			});
+			const result = await switchWithDirectory(context, sessionFile, directory, (nextContext) =>
+				sendAndTrackGroupSession(state, chatId, sessionFile, nextContext, prompt),
+			);
 			if (result.cancelled) throw new Error("切换到飞书群绑定的 Pi 会话已取消。");
 			return;
 		}
@@ -202,6 +219,15 @@ async function sendToChatSession(state: SharedFeishuState, chatId: string, promp
 				state.latestCommandContext = nextContext;
 				const currentFile = nextContext.sessionManager.getSessionFile();
 				if (currentFile) await state.controller.setChatSessionFile(chatId, currentFile);
+				if (directory) {
+					// 新会话默认继承当前 cwd：显式重新锚定到绑定目录，再投递消息。
+					const anchored = await switchWithDirectory(nextContext, currentFile ?? "", directory, (finalContext) => {
+						state.latestCommandContext = finalContext;
+						return finalContext.sendUserMessage(prompt);
+					});
+					if (anchored.cancelled) throw new Error("锚定群会话工作目录已取消。");
+					return;
+				}
 				await nextContext.sendUserMessage(prompt);
 			},
 		});
@@ -209,6 +235,60 @@ async function sendToChatSession(state: SharedFeishuState, chatId: string, promp
 	} finally {
 		state.switchingSession = false;
 	}
+}
+
+/**
+ * 切换会话并在切换完成后（含目录锚定）执行回调。
+ * Pi 的命令上下文 d.ts 未声明 cwdOverride，但三种运行模式的 switchSession handler
+ * 都会把 options 原样转发给 runtime，而 runtime 完整支持 override（切换后
+ * createRuntime 直接使用 override 后的 cwd）。这里做一次窄化并在切换后校验
+ * cwd 生效——若未来 Pi 改为丢弃该参数，会得到可操作的错误而不是静默串目录。
+ */
+async function switchWithDirectory(
+	context: ExtensionCommandContext,
+	sessionFile: string,
+	directory: string | undefined,
+	withSession: WithSessionCallback,
+): Promise<{ cancelled: boolean }> {
+	if (!directory) {
+		return context.switchSession(sessionFile, { withSession });
+	}
+	const options = { cwdOverride: directory, withSession };
+	const switcher = context.switchSession as unknown as (
+		path: string,
+		options: { cwdOverride: string; withSession: WithSessionCallback },
+	) => Promise<{ cancelled: boolean }>;
+	const result = await switcher.call(context, sessionFile, options);
+	if (!result.cancelled) {
+		const effectiveCwd = safeCwd(context);
+		if (effectiveCwd && effectiveCwd !== directory) {
+			throw new Error(
+				`群会话未能切换到绑定目录（当前：${effectiveCwd}）。请重启本地 Pi 后重试，或在本地执行 /feishu status 刷新会话控制。`,
+			);
+		}
+	}
+	return result;
+}
+
+function safeCwd(context: ExtensionContext): string | undefined {
+	try {
+		return context.cwd;
+	} catch {
+		return undefined;
+	}
+}
+
+async function sendAndTrackGroupSession(
+	state: SharedFeishuState,
+	chatId: string,
+	sessionFile: string,
+	nextContext: SwitchCallback,
+	prompt: string,
+): Promise<void> {
+	state.latestCommandContext = nextContext;
+	const currentFile = nextContext.sessionManager.getSessionFile();
+	if (currentFile && currentFile !== sessionFile) await state.controller.setChatSessionFile(chatId, currentFile);
+	await nextContext.sendUserMessage(prompt);
 }
 
 export interface ParsedFeishuCommand {
@@ -386,7 +466,7 @@ export function renderFeishuStatus(status: FeishuStatus, scopeHealth?: string[])
 
 export default function feishuExtension(pi: ExtensionAPI): void {
 	const state = getSharedState();
-	state.sendCurrentMessage = (text) => pi.sendUserMessage(text);
+	state.sendCurrentMessage = (text, options) => pi.sendUserMessage(text, options);
 	let latestContext: ExtensionContext | undefined;
 	let latestCommandContext: ExtensionCommandContext | undefined;
 
@@ -505,25 +585,42 @@ export default function feishuExtension(pi: ExtensionAPI): void {
 		state.activeBridge?.cancel("Pi 会话已关闭。");
 	});
 
+	// 对齐 easycodeclient：Owner 通过 /bind 或建群显式绑定的目录视为受信项目，
+	// 免去切换群会话时的本地信任弹窗。undecided = 不表态，Pi 落回默认流程
+	//（runner 对 undecided 的 handler 会跳过）；handler 用带注解的变量传入，
+	// 内联箭头会让 on() 的重载推断失败。
+	const onProjectTrust: ProjectTrustHandler = (event) => {
+		if (state.controller.getBoundDirectories().includes(event.cwd)) {
+			return { trusted: "yes", remember: true };
+		}
+		return { trusted: "undecided" };
+	};
+	pi.on("project_trust", onProjectTrust);
+
 	pi.registerTool({
 		name: "feishu_create_group",
 		label: "Create Feishu Group",
 		description:
-			"Create a Feishu group chat and invite the currently bound owner. Use when asked to 拉群、建群、创建飞书群 or create a group. This creates only the group (not a local project directory).",
+			"Create a Feishu group chat and invite the currently bound owner. Use when asked to 拉群、建群、创建飞书群 or create a group. Pass `path` when the user mentions a directory (e.g. 拉个群 /path/to/project) to anchor the group's sessions to that working directory; the directory must already exist.",
 		parameters: Type.Object({
 			name: Type.String({ description: "Name for the new Feishu group chat" }),
+			path: Type.Optional(
+				Type.String({ description: "Absolute path of an existing local directory to anchor the group to" }),
+			),
 		}),
 		async execute(_toolCallId, params) {
+			const name = params.name.trim();
 			try {
-				const chatId = await state.controller.createGroupChat(params.name.trim());
+				const chatId = await state.controller.createGroupChat(name, params.path?.trim() || undefined);
+				const anchored = params.path?.trim() ? `，并锚定到目录 ${params.path.trim()}` : "";
 				return {
 					content: [
 						{
 							type: "text",
-							text: `群聊「${params.name.trim()}」已创建，群聊 ID：${chatId}。已邀请当前绑定的飞书用户，并发送群欢迎消息。`,
+							text: `群聊「${name}」已创建，群聊 ID：${chatId}${anchored}。已邀请当前绑定的飞书用户，并发送群欢迎消息。`,
 						},
 					],
-					details: { chatId, name: params.name.trim() },
+					details: { chatId, name },
 				};
 			} catch (error) {
 				return {

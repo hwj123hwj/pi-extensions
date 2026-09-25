@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import type {
 	AgentBridge,
@@ -171,6 +171,7 @@ class FakeAgent implements AgentBridge {
 	runOptions: Array<{ chatId?: string } | undefined> = [];
 	cancelCalls = 0;
 	runImpl: (text: string) => Promise<string> = async (text) => `Pi: ${text}`;
+	steerImpl: (text: string) => boolean = () => false;
 
 	run(
 		text: string,
@@ -189,6 +190,10 @@ class FakeAgent implements AgentBridge {
 
 	cancel(): void {
 		this.cancelCalls += 1;
+	}
+
+	steer(text: string): boolean {
+		return this.steerImpl(text);
 	}
 }
 
@@ -1079,5 +1084,119 @@ describe("FeishuController", () => {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 
 		expect(gateway.sent).toEqual([]);
+	});
+
+	it("anchors a managed group to a directory via /bind <dir>", async () => {
+		const { store, gateway, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		await controller.start({});
+
+		const projectDir = tmpdir();
+		await gateway.emit(
+			privateText({ messageId: "om_bind_dir", chatId: "oc_proj", chatType: "group", text: `/bind ${projectDir}` }),
+		);
+
+		expect(store.state?.managedGroupIds).toContain("oc_proj");
+		expect(store.state?.groupDirs?.oc_proj).toBe(resolve(projectDir));
+		expect(gateway.sent.at(-1)?.text).toContain("已锚定到目录");
+		expect(controller.getChatDirectory("oc_proj")).toBe(resolve(projectDir));
+		expect(controller.getBoundDirectories()).toEqual([resolve(projectDir)]);
+	});
+
+	it("rejects /bind with a nonexistent directory", async () => {
+		const { store, gateway, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		await controller.start({});
+
+		await gateway.emit(
+			privateText({
+				messageId: "om_bind_bad",
+				chatId: "oc_proj",
+				chatType: "group",
+				text: "/bind /definitely/not/a/real/dir",
+			}),
+		);
+
+		expect(store.state?.managedGroupIds).toBeUndefined();
+		expect(gateway.sent.at(-1)?.text).toContain("目录不存在");
+		expect(controller.getChatDirectory("oc_proj")).toBeUndefined();
+	});
+
+	it("steers a follow-up message into the running turn of the same chat", async () => {
+		const steered: string[] = [];
+		const { gateway, agent, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		agent.steerImpl = (text) => {
+			steered.push(text);
+			return true;
+		};
+		const releases: Array<() => void> = [];
+		agent.runImpl = (text) =>
+			new Promise<string>((resolve) => {
+				releases.push(() => resolve(`done: ${text}`));
+			});
+		await controller.start({});
+
+		await gateway.emit(privateText({ messageId: "om_first", text: "long running task" }));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		await gateway.emit(privateText({ messageId: "om_second", text: "补充一点" }));
+
+		// 未排队、未驱动第二轮，而是并入运行中的轮次
+		expect(agent.calls).toEqual(["long running task"]);
+		expect(steered).toEqual(["补充一点"]);
+		expect(gateway.sent.at(-1)?.text).toContain("已并入当前正在处理的对话");
+
+		releases[0]?.();
+		await controller.waitForIdle();
+	});
+
+	it("falls back to the queue when steering is unavailable or for other chats", async () => {
+		const steered: string[] = [];
+		const { gateway, agent, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		agent.steerImpl = (text) => {
+			steered.push(text);
+			return true;
+		};
+		const releases: Array<() => void> = [];
+		agent.runImpl = (text) =>
+			text.endsWith("群消息")
+				? Promise.resolve(`done: ${text}`)
+				: new Promise<string>((resolve) => {
+						releases.push(() => resolve(`done: ${text}`));
+					});
+		await controller.start({});
+
+		// 该群先绑定，才会走到授权后的排队路径
+		await gateway.emit(
+			privateText({ messageId: "om_bind", chatId: "oc_group", chatType: "group", senderOpenId: "ou_owner", text: "/bind" }),
+		);
+		await gateway.emit(privateText({ messageId: "om_first", text: "long task" }));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		// 私聊在跑，群里的消息不该并进私聊轮次
+		await gateway.emit(
+			privateText({ messageId: "om_group", chatId: "oc_group", chatType: "group", text: "群消息" }),
+		);
+
+		expect(steered).toEqual([]);
+		const tips = sentTo(gateway, "oc_group");
+		expect(tips.at(-1)?.text).toContain("排队中");
+
+		// 群消息排在私聊任务之后，释放全部在跑的轮次让队列排空
+		for (const release of releases) release?.();
+		await controller.waitForIdle();
+		expect(agent.calls).toEqual(["long task", "[飞书群聊] ou_owner：群消息"]);
 	});
 });
