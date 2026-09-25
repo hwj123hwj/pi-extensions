@@ -20,9 +20,16 @@ export interface GroupAgentRunOptions {
 
 const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
 
+interface AssistantStreamEvent {
+	type?: string;
+	delta?: string;
+	contentIndex?: number;
+}
+
 interface PrintEvent {
 	type?: string;
 	message?: { role?: string; content?: unknown };
+	assistantMessageEvent?: AssistantStreamEvent;
 	toolName?: string;
 }
 
@@ -80,6 +87,7 @@ export class GroupAgentRunner {
 			let stdoutBuffer = "";
 			let stderrBuffer = "";
 			let latestAssistantText = "";
+			let streamedText = "";
 			let settled = false;
 			const timer = setTimeout(() => {
 				child.kill("SIGTERM");
@@ -97,14 +105,21 @@ export class GroupAgentRunner {
 				resolve({ text: latestAssistantText, exitCode: child.exitCode });
 			};
 
+			const emitText = (text: string) => {
+				latestAssistantText = text;
+				observer?.onText?.(text);
+			};
+
 			child.stdout?.on("data", (chunk: Buffer) => {
 				stdoutBuffer += chunk.toString("utf8");
 				let newlineIndex = stdoutBuffer.indexOf("\n");
 				while (newlineIndex !== -1) {
 					const line = stdoutBuffer.slice(0, newlineIndex).trim();
 					stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-					this.handleJsonLine(line, observer, (text) => {
-						latestAssistantText = text;
+					this.handleJsonLine(line, observer, emitText, () => {
+						streamedText = "";
+					}, () => streamedText, (next) => {
+						streamedText = next;
 					});
 					newlineIndex = stdoutBuffer.indexOf("\n");
 				}
@@ -117,7 +132,7 @@ export class GroupAgentRunner {
 			});
 			child.on("close", (code) => {
 				if (code === 0) {
-					observer?.onText?.(latestAssistantText);
+					if (!latestAssistantText && streamedText) emitText(streamedText);
 					finish();
 					return;
 				}
@@ -130,7 +145,10 @@ export class GroupAgentRunner {
 	private handleJsonLine(
 		line: string,
 		observer: AgentProgressObserver | undefined,
-		setLatest: (text: string) => void,
+		emitText: (text: string) => void,
+		resetStream: () => void,
+		getStream: () => string,
+		setStream: (text: string) => void,
 	): void {
 		if (!line) return;
 		let event: PrintEvent;
@@ -144,11 +162,23 @@ export class GroupAgentRunner {
 			observer?.onActivity?.({ kind: "tool", toolName });
 			return;
 		}
-		if (event.type !== "message_update" || event.message?.role !== "assistant") return;
-		const text = extractText(event.message.content);
-		if (text) {
-			setLatest(text);
-			observer?.onText?.(text);
+		// 实测事件形状：message_update 携带 assistantMessageEvent（text_start/text_delta/text_end），
+		// 完整的助手文本在 message_end.message.content 里（权威值，用于最终回复）。
+		if (event.type === "message_update") {
+			const streamEvent = event.assistantMessageEvent;
+			if (streamEvent?.type === "text_start") {
+				resetStream();
+				return;
+			}
+			if (streamEvent?.type === "text_delta" && typeof streamEvent.delta === "string") {
+				setStream(getStream() + streamEvent.delta);
+				emitText(getStream());
+			}
+			return;
+		}
+		if (event.type === "message_end" && event.message?.role === "assistant") {
+			const text = extractText(event.message.content);
+			if (text) emitText(text);
 		}
 	}
 }

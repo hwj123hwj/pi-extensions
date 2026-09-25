@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { mkdtemp, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { defaultGroupSessionFile, GroupAgentRunner } from "../src/group-agent.js";
 import type { AgentProgressObserver } from "../src/contracts.js";
@@ -13,7 +14,7 @@ interface FakeChild extends EventEmitter {
 	exitCode: number | null;
 }
 
-/** 可注入的假 spawn：记录调用参数，用预置 stdout 行完成。 */
+/** 可注入的假 spawn：记录调用参数，按预置 stdout 行完成。 */
 function fakeSpawn(lines: string[], exitCode = 0, stderr = "") {
 	const calls: Array<{ bin: string; args: string[]; cwd: string | undefined }> = [];
 	const impl = ((bin: string, args: string[], options?: { cwd?: string }) => {
@@ -33,13 +34,21 @@ function fakeSpawn(lines: string[], exitCode = 0, stderr = "") {
 	return { impl, calls };
 }
 
-function textEvent(text: string): string {
-	return JSON.stringify({ type: "message_update", message: { role: "assistant", content: [{ type: "text", text }] } });
+/** 模拟 pi 实测的事件流：message_update 增量 + message_end 权威文本。 */
+function delta(text: string): string {
+	return JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text } });
+}
+
+function messageEnd(text: string): string {
+	return JSON.stringify({
+		type: "message_end",
+		message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" },
+	});
 }
 
 describe("GroupAgentRunner", () => {
 	it("spawns pi headless in the bound directory with the group session file", async () => {
-		const { impl, calls } = fakeSpawn([textEvent("答案")]);
+		const { impl, calls } = fakeSpawn([messageEnd("答案")]);
 		const runner = new GroupAgentRunner({ spawnImpl: impl, bin: "pi-test" });
 		const sessionFile = join(tmpdir(), `group-${Date.now()}.jsonl`);
 
@@ -51,11 +60,13 @@ describe("GroupAgentRunner", () => {
 		expect(calls[0]?.args).toEqual(["-p", "--mode", "json", "--session", sessionFile, "帮我看看"]);
 	});
 
-	it("streams the latest assistant text and tool activity through the observer", async () => {
+	it("streams text deltas and settles on the authoritative message_end text", async () => {
 		const { impl } = fakeSpawn([
-			textEvent("第一段"),
+			JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_start", contentIndex: 0 } }),
+			delta("第一"),
 			JSON.stringify({ type: "tool_execution_start", toolName: "read" }),
-			textEvent("第一段\n第二段"),
+			delta("第一第二"),
+			messageEnd("第一第二（最终）"),
 		]);
 		const runner = new GroupAgentRunner({ spawnImpl: impl });
 		const activities: Array<{ kind: string; toolName?: string }> = [];
@@ -67,9 +78,20 @@ describe("GroupAgentRunner", () => {
 
 		const result = await runner.run(join(tmpdir(), "s.jsonl"), undefined, "prompt", observer);
 
-		expect(result.text).toBe("第一段\n第二段");
+		expect(result.text).toBe("第一第二（最终）");
 		expect(activities).toContainEqual({ kind: "tool", toolName: "read" });
-		expect(texts.at(-1)).toBe("第一段\n第二段");
+		expect(texts).toContain("第一");
+		// delta 是增量：两次 delta 后流文本为拼接结果
+		expect(texts).toContain("第一第一第二");
+		expect(texts.at(-1)).toBe("第一第二（最终）");
+	});
+
+	it("falls back to streamed deltas when message_end is absent", async () => {
+		const { impl } = fakeSpawn([delta("只有增量")]);
+		const runner = new GroupAgentRunner({ spawnImpl: impl });
+
+		const result = await runner.run(join(tmpdir(), "s.jsonl"), undefined, "prompt");
+		expect(result.text).toBe("只有增量");
 	});
 
 	it("rejects with the stderr content when the child exits nonzero", async () => {
@@ -82,7 +104,7 @@ describe("GroupAgentRunner", () => {
 	it("creates the session file's parent directory before spawning", async () => {
 		const directory = await mkdtemp(join(tmpdir(), "pi-feishu-grp-"));
 		const sessionFile = join(directory, "deep", "dir", "s.jsonl");
-		const { impl } = fakeSpawn([textEvent("ok")]);
+		const { impl } = fakeSpawn([messageEnd("ok")]);
 		const runner = new GroupAgentRunner({ spawnImpl: impl });
 
 		await runner.run(sessionFile, undefined, "prompt");
