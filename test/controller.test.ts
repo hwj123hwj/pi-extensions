@@ -15,6 +15,7 @@ import type {
 	PiRuntime,
 } from "../src/contracts.js";
 import { buildAgentPrompt, FeishuController, resolveAllowTarget } from "../src/controller.js";
+import { REQUIRED_APP_SCOPES, SENSITIVE_GROUP_MSG_SCOPE } from "../src/scopes.js";
 
 class MemoryCredentialStore implements CredentialStore {
 	state: FeishuCredentials | null = null;
@@ -35,7 +36,7 @@ class MemoryCredentialStore implements CredentialStore {
 class FakeGateway implements FeishuGateway {
 	connectCalls = 0;
 	disconnectCalls = 0;
-	sent: Array<{ chatId: string; text: string; replyTo?: string }> = [];
+	sent: Array<{ chatId: string; text: string; messageId: string; replyTo?: string }> = [];
 	replies: FakeReply[] = [];
 	reactions: Array<{ messageId: string; emojiType: string }> = [];
 	removedReactions: Array<{ messageId: string; reactionId: string }> = [];
@@ -97,8 +98,9 @@ class FakeGateway implements FeishuGateway {
 	}
 
 	async sendText(chatId: string, text: string, replyTo?: string): Promise<string | undefined> {
-		this.sent.push(replyTo ? { chatId, text, replyTo } : { chatId, text });
-		return `om_sent_${this.nextId++}`;
+		const messageId = `om_sent_${this.nextId++}`;
+		this.sent.push({ chatId, text, messageId, ...(replyTo ? { replyTo } : {}) });
+		return messageId;
 	}
 
 	async beginReply(chatId: string, replyTo: string): Promise<FakeReply> {
@@ -251,6 +253,16 @@ function privateText(overrides: Partial<FeishuIncomingMessage> = {}): FeishuInco
 		text: "hello",
 		...overrides,
 	};
+}
+
+function sentIdFor(gateway: FakeGateway, replyTo: string): string {
+	const entry = gateway.sent.find((item) => item.replyTo === replyTo);
+	if (!entry) throw new Error(`no sent message replies to ${replyTo}`);
+	return entry.messageId;
+}
+
+function sentTo(gateway: FakeGateway, chatId: string): Array<{ text: string }> {
+	return gateway.sent.filter((entry) => entry.chatId === chatId);
 }
 
 function createFixture(
@@ -515,12 +527,14 @@ describe("FeishuController", () => {
 		await gateway.emit(privateText({ messageId: "om_unknown", text: "/definitely-not-a-command" }));
 
 		expect(agent.calls).toEqual([]);
-		expect(gateway.sent.map((entry) => entry.chatId)).toEqual(["oc_private", "oc_private", "oc_private"]);
-		expect(gateway.sent[0]?.text).toContain("/stop");
-		expect(gateway.sent[0]?.text).toContain("其余消息会直接发送给当前 Pi 会话处理");
-		expect(gateway.sent[1]?.text).toContain("队列：0");
-		expect(gateway.sent[1]?.text).toContain("模型：未知");
-		expect(gateway.sent[2]?.text).toContain("❓ 未知命令：/definitely-not-a-command");
+		// 启动欢迎语也走 sendText，先按聊天过滤再断言命令回复。
+		const commandReplies = gateway.sent.filter((entry) => entry.chatId === "oc_private");
+		expect(commandReplies.map((entry) => entry.chatId)).toEqual(["oc_private", "oc_private", "oc_private"]);
+		expect(commandReplies[0]?.text).toContain("/stop");
+		expect(commandReplies[0]?.text).toContain("其余消息会直接发送给当前 Pi 会话处理");
+		expect(commandReplies[1]?.text).toContain("队列：0");
+		expect(commandReplies[1]?.text).toContain("模型：未知");
+		expect(commandReplies[2]?.text).toContain("❓ 未知命令：/definitely-not-a-command");
 		expect(gateway.replies).toEqual([]);
 	});
 
@@ -605,7 +619,7 @@ describe("FeishuController", () => {
 
 		releases[0]?.();
 		await new Promise((resolve) => setTimeout(resolve, 0));
-		expect(gateway.recalled).toContain("om_sent_1");
+		expect(gateway.recalled).toContain(sentIdFor(gateway, "om_second"));
 
 		releases[1]?.();
 		await controller.waitForIdle();
@@ -645,8 +659,8 @@ describe("FeishuController", () => {
 		const cleared = gateway.removedReactions.map((entry) => entry.messageId);
 		expect(cleared).toContain("om_second");
 		expect(cleared).toContain("om_third");
-		expect(gateway.recalled).toContain("om_sent_1");
-		expect(gateway.recalled).toContain("om_sent_2");
+		expect(gateway.recalled).toContain(sentIdFor(gateway, "om_second"));
+		expect(gateway.recalled).toContain(sentIdFor(gateway, "om_third"));
 	});
 
 	it("renumbers remaining queue tips when an earlier task finishes", async () => {
@@ -673,9 +687,9 @@ describe("FeishuController", () => {
 		releases[0]?.();
 		await new Promise((resolve) => setTimeout(resolve, 0));
 
-		expect(gateway.recalled).toContain("om_sent_1");
+		expect(gateway.recalled).toContain(sentIdFor(gateway, "om_second"));
 		expect(gateway.edits).toContainEqual({
-			messageId: "om_sent_2",
+			messageId: sentIdFor(gateway, "om_third"),
 			text: expect.stringContaining("第 2 位"),
 		});
 
@@ -712,7 +726,7 @@ describe("FeishuController", () => {
 			action: "added",
 		});
 		gateway.emitReaction({ messageId: "om_third", operatorOpenId: "ou_owner", emojiType: "THINKING", action: "added" });
-		expect(gateway.recalled).not.toContain("om_sent_2");
+		expect(gateway.recalled).not.toContain(sentIdFor(gateway, "om_second"));
 
 		gateway.emitReaction({
 			messageId: "om_second",
@@ -721,11 +735,11 @@ describe("FeishuController", () => {
 			action: "added",
 		});
 
-		expect(gateway.recalled).toContain("om_sent_1");
+		expect(gateway.recalled).toContain(sentIdFor(gateway, "om_second"));
 		const cleared = gateway.removedReactions.map((entry) => entry.messageId);
 		expect(cleared).toContain("om_second");
 		expect(gateway.edits).toContainEqual({
-			messageId: "om_sent_2",
+			messageId: sentIdFor(gateway, "om_third"),
 			text: expect.stringContaining("第 2 位"),
 		});
 
@@ -744,9 +758,9 @@ describe("FeishuController", () => {
 		});
 		await controller.start({});
 
-		// 未被 @ 的陌生群消息：完全静默
+		// 未被 @ 的陌生群消息：完全静默（启动欢迎语发给 Owner，不计入群聊断言）
 		await gateway.emit(privateText({ messageId: "om_g1", chatId: "oc_free", chatType: "group", text: "普通闲聊" }));
-		expect(gateway.sent).toEqual([]);
+		expect(sentTo(gateway, "oc_free")).toEqual([]);
 		expect(agent.calls).toEqual([]);
 
 		// 非 Owner 被 @：明确拒绝
@@ -1038,5 +1052,32 @@ describe("FeishuController", () => {
 		expect(resolveAllowTarget("ou_bob", undefined)).toEqual({ openId: "ou_bob" });
 		expect(resolveAllowTarget("@Bob", undefined)).toBeUndefined();
 		expect(resolveAllowTarget("", undefined)).toBeUndefined();
+	});
+
+	it("dms a startup welcome with scope health to the bound Owner on start", async () => {
+		const { gateway, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		});
+		gateway.grantedScopes = [...REQUIRED_APP_SCOPES, SENSITIVE_GROUP_MSG_SCOPE];
+		await controller.start({});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		const welcome = gateway.sent.find((entry) => entry.chatId === "ou_owner");
+		expect(welcome?.text).toContain("Pi 飞书 Bot 已上线");
+		expect(welcome?.text).toContain("主会话工作目录");
+		expect(welcome?.text).toContain("✅ 应用权限配置完整");
+	});
+
+	it("skips the startup welcome when no Owner is bound yet", async () => {
+		const { gateway, controller } = createFixture({
+			appId: "cli_test",
+			appSecret: "secret",
+		});
+		await controller.start({});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(gateway.sent).toEqual([]);
 	});
 });

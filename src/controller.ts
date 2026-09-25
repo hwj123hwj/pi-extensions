@@ -25,7 +25,12 @@ import { MessageDeduplicator } from "./message-deduplicator.js";
 import { SerialMessageQueue } from "./message-queue.js";
 import { OwnerBinding } from "./owner-binding.js";
 import { executeRemoteCommand, type ParsedRemoteCommand, parseRemoteCommand } from "./remote-commands.js";
-import { buildBotAddedGuidance, buildGroupPermissionReminder } from "./scopes.js";
+import {
+	buildBotAddedGuidance,
+	buildGroupPermissionReminder,
+	buildScopeHealthSection,
+	buildStartupWelcome,
+} from "./scopes.js";
 
 // 与 easycodeclient 的飞书集成一致：THINKING 表情兼作"已读 + 处理中"回执。
 const READ_REACTION_EMOJI = "THINKING";
@@ -136,6 +141,8 @@ export class FeishuController {
 						...(existing.ownerOpenId ? { ownerOpenId: existing.ownerOpenId } : {}),
 						...(existing.managedGroupIds ? { managedGroupIds: existing.managedGroupIds } : {}),
 						...(existing.groupSessions ? { groupSessions: existing.groupSessions } : {}),
+						...(existing.allowlist ? { allowlist: existing.allowlist } : {}),
+						...(existing.allowlistNames ? { allowlistNames: existing.allowlistNames } : {}),
 					}
 				: credentials;
 		await this.store.save(next);
@@ -175,8 +182,24 @@ export class FeishuController {
 		gateway.onReaction((event) => this.handleReaction(event));
 		this.botAddedUnsubscribe = gateway.onBotAdded?.((event) => void this.handleBotAdded(event));
 
+		// 对齐 easycodeclient：网关启动后私聊 Owner 发欢迎语 + 权限体检。
+		// 主动 await 保证欢迎语先于任何消息回复送达；probe/发送失败都不阻塞启动。
+		if (credentials.ownerOpenId) await this.sendStartupWelcome(gateway, credentials);
+
 		const bindingCode = binding.getOrCreateCode();
 		return bindingCode ? { alreadyRunning: false, bindingCode } : { alreadyRunning: false };
+	}
+
+	/** Bot 上线后私聊 Owner 的欢迎语；probe 失败时只发正文，不猜权限状态。 */
+	private async sendStartupWelcome(gateway: FeishuGateway, credentials: FeishuCredentials): Promise<void> {
+		const ownerOpenId = credentials.ownerOpenId;
+		if (!ownerOpenId) return;
+		const probe = await this.probeScopes();
+		const welcome = buildStartupWelcome({
+			cwd: process.cwd(),
+			healthSection: buildScopeHealthSection(credentials.appId, probe.grantedScopes),
+		});
+		await gateway.sendText(ownerOpenId, welcome).catch(() => undefined);
 	}
 
 	async createGroupChat(name: string): Promise<string> {

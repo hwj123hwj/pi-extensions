@@ -10,6 +10,7 @@ import {
 	buildEventSubUrl,
 	buildPermissionPageUrl,
 	buildScopeApplyUrl,
+	buildScopeHealthSection,
 	hasScope,
 	missingScopes,
 	REQUIRED_APP_SCOPES,
@@ -336,24 +337,9 @@ export async function appendScopeHealthHint(
 	dashboard: string,
 	grantedScopes?: string[],
 ): Promise<string> {
-	if (!grantedScopes) return dashboard;
-	const missing = missingScopes(grantedScopes, REQUIRED_APP_SCOPES);
-	const hasGroupMsg = hasScope(grantedScopes, SENSITIVE_GROUP_MSG_SCOPE);
-	if (missing.length === 0 && hasGroupMsg) {
-		return `${dashboard}\n\n✅ 应用权限配置完整，所有功能均可正常使用。`;
-	}
-	const lines = ["", "⚠️ 以下应用权限尚未开通，对应功能会受限："];
-	if (missing.length > 0) {
-		lines.push(`📋 缺失 ${missing.length} 项基础权限，点击一键申请：`);
-		lines.push(`👉 ${buildScopeApplyUrl({ appId, scopes: missing })}`);
-	}
-	if (!hasGroupMsg) {
-		lines.push("💬 「免 @ 响应」权限未开：群内需 @机器人 才能触发，点击开通：");
-		lines.push(`👉 ${buildScopeApplyUrl({ appId, scopes: [SENSITIVE_GROUP_MSG_SCOPE] })}`);
-	}
-	lines.push("🔄 权限生效（需发布应用版本）：");
-	lines.push(`👉 ${buildPermissionPageUrl(appId)}`);
-	return `${dashboard}\n${lines.join("\n")}`;
+	const section = buildScopeHealthSection(appId, grantedScopes);
+	if (!section) return dashboard;
+	return `${dashboard}\n\n${section}`;
 }
 
 export function renderFeishuStatus(status: FeishuStatus, scopeHealth?: string[]): string {

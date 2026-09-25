@@ -407,8 +407,9 @@ class SdkFeishuReply implements FeishuReply {
 	}
 
 	async fail(reason?: string): Promise<void> {
-		const suffix = reason ? `：${reason}` : "，请稍后再试。";
-		await this.finish({ text: this.snapshot.text || "处理消息失败", status: "处理失败" }, `处理消息失败${suffix}`);
+		const detail = reason ? `处理消息失败：${reason}` : "处理消息失败，请稍后再试。";
+		const text = this.snapshot.text ? `${this.snapshot.text}\n\n⚠️ ${detail}` : detail;
+		await this.finish({ text, status: "处理失败" }, detail);
 	}
 
 	async cancel(): Promise<void> {

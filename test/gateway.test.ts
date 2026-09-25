@@ -271,4 +271,18 @@ describe("SdkFeishuGateway", () => {
 		]);
 		expect(channel.streamFinished).toBe(true);
 	});
+
+	it("renders the failure reason into the final card instead of only the fallback text", async () => {
+		const channel = new FakeChannel();
+		const gateway = new SdkFeishuGateway({ appId: "cli_test", appSecret: "secret" }, createFactory(channel));
+		await gateway.connect(() => undefined);
+		const reply = await gateway.beginReply("oc_1", "om_1");
+		await reply.fail("Pi 会话控制尚未就绪，请先在本地执行一次 /feishu status。");
+
+		const finalCard = channel.streamedCards.at(-1) as { elements: Array<{ tag: string; content?: string }> };
+		const markdown = finalCard.elements.find((element) => element.tag === "markdown");
+		expect(markdown?.content).toContain("处理消息失败：Pi 会话控制尚未就绪");
+		expect(channel.sent).toEqual([]);
+		await gateway.disconnect();
+	});
 });

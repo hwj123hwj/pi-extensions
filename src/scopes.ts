@@ -164,3 +164,51 @@ export function buildBotAddedGuidance(params: {
 	lines.push(`🔄 权限变更后需发布新版本生效：${buildPermissionPageUrl(params.appId)}`);
 	return lines.join("\n");
 }
+
+/**
+ * 权限体检段落：grantedScopes 未知时返回 null（不猜）；
+ * 全部就绪时返回 ✅ 段落，否则返回缺失清单 + 一键申请链接。
+ */
+export function buildScopeHealthSection(appId: string, grantedScopes?: readonly string[]): string | null {
+	if (!grantedScopes) return null;
+	const missing = missingScopes(grantedScopes, REQUIRED_APP_SCOPES);
+	const hasGroupMsg = hasScope(grantedScopes, SENSITIVE_GROUP_MSG_SCOPE);
+	if (missing.length === 0 && hasGroupMsg) {
+		return "✅ 应用权限配置完整，所有功能均可正常使用。";
+	}
+	const lines = ["⚠️ 以下应用权限尚未开通，对应功能会受限："];
+	if (missing.length > 0) {
+		lines.push(`📋 缺失 ${missing.length} 项基础权限，点击一键申请：`);
+		lines.push(`👉 ${buildScopeApplyUrl({ appId, scopes: missing })}`);
+	}
+	if (!hasGroupMsg) {
+		lines.push("💬 「免 @ 响应」权限未开：群内需 @机器人 才能触发，点击开通：");
+		lines.push(`👉 ${buildScopeApplyUrl({ appId, scopes: [SENSITIVE_GROUP_MSG_SCOPE] })}`);
+	}
+	lines.push("🔄 权限生效（需发布应用版本）：");
+	lines.push(`👉 ${buildPermissionPageUrl(appId)}`);
+	return lines.join("\n");
+}
+
+/**
+ * 对齐 easycodeclient：Bot 上线后私聊 Owner 的欢迎语，
+ * 包含工作目录、使用提示和权限体检结果。
+ */
+export function buildStartupWelcome(params: { cwd?: string; healthSection?: string | null }): string {
+	const lines = ["👋 Pi 飞书 Bot 已上线，随时待命。"];
+	if (params.cwd) {
+		lines.push("", "**📂 主会话工作目录**", `\`${params.cwd}\``);
+	}
+	lines.push(
+		"",
+		"**💡 使用提示**",
+		"- 私聊直接发送问题即可",
+		"- Owner 在群里发送 /bind 可把群绑定到独立 Pi 会话",
+		"",
+		"**❓ 需要帮助**：发送 /help 查看所有可用命令",
+	);
+	if (params.healthSection) {
+		lines.push("", "---", "", params.healthSection);
+	}
+	return lines.join("\n");
+}
