@@ -35,8 +35,13 @@ interface SharedFeishuState {
 	mainSessionFile: string | undefined;
 	/** Pi 进程当前所在的会话文件，随每个事件刷新。 */
 	currentSessionFile: string | undefined;
-	/** 群绑定相关 switch/newSession 进行中的标记：期间出现的会话文件不得记为主会话。 */
-	bindingGroupChat: boolean;
+	/**
+	 * 本扩展发起的 switch/newSession 进行中的标记：
+	 * - 期间出现的会话文件不得记为主会话；
+	 * - Pi 对旧会话发出的 session_shutdown 是我们自己引起的，
+	 *   不能据此取消正在等待的飞书轮次（否则群消息必然失败）。
+	 */
+	switchingSession: boolean;
 }
 
 const SHARED_STATE_KEY = "__piFeishuSharedState__";
@@ -58,7 +63,7 @@ function getSharedState(): SharedFeishuState {
 		sendCurrentMessage: undefined,
 		mainSessionFile: undefined,
 		currentSessionFile: undefined,
-		bindingGroupChat: false,
+		switchingSession: false,
 		controller: undefined as unknown as FeishuController,
 	};
 	const proxyAgent: AgentBridge = {
@@ -85,7 +90,7 @@ function getSharedState(): SharedFeishuState {
 		newChatSession: async (chatId) => {
 			const context = state.latestCommandContext;
 			if (!context) return false;
-			state.bindingGroupChat = true;
+			state.switchingSession = true;
 			try {
 				const result = await context.newSession({
 					withSession: async (nextContext) => {
@@ -96,7 +101,7 @@ function getSharedState(): SharedFeishuState {
 				});
 				return !result.cancelled;
 			} finally {
-				state.bindingGroupChat = false;
+				state.switchingSession = false;
 			}
 		},
 		setThinkingLevel: (level) => state.current?.runtime.setThinkingLevel(level) ?? Promise.resolve(false),
@@ -124,7 +129,7 @@ function observeSessionFile(state: SharedFeishuState, context: ExtensionContext)
 	const file = tryGetSessionFile(context);
 	if (!file) return;
 	state.currentSessionFile = file;
-	if (state.bindingGroupChat) return;
+	if (state.switchingSession) return;
 	if (state.controller.isGroupSessionFile(file)) return;
 	state.mainSessionFile = file;
 }
@@ -157,20 +162,25 @@ async function sendToMainSession(state: SharedFeishuState, prompt: string): Prom
 		// 主会话与当前会话不一致却没有命令上下文：直发会串进群会话，给出可操作的错误更安全。
 		throw new Error("Pi 会话控制尚未就绪，请先在本地执行一次 /feishu status。");
 	}
-	const result = await context.switchSession(main, {
-		withSession: async (nextContext) => {
-			state.latestCommandContext = nextContext;
-			await nextContext.sendUserMessage(prompt);
-		},
-	});
-	if (result.cancelled) throw new Error("切回主 Pi 会话已取消。");
+	state.switchingSession = true;
+	try {
+		const result = await context.switchSession(main, {
+			withSession: async (nextContext) => {
+				state.latestCommandContext = nextContext;
+				await nextContext.sendUserMessage(prompt);
+			},
+		});
+		if (result.cancelled) throw new Error("切回主 Pi 会话已取消。");
+	} finally {
+		state.switchingSession = false;
+	}
 }
 
 async function sendToChatSession(state: SharedFeishuState, chatId: string, prompt: string): Promise<void> {
 	const context = state.latestCommandContext;
 	if (!context) throw new Error("Pi 会话控制尚未就绪，请先在本地执行一次 /feishu status。");
 
-	state.bindingGroupChat = true;
+	state.switchingSession = true;
 	try {
 		const sessionFile = state.controller.getChatSessionFile(chatId);
 		if (sessionFile) {
@@ -197,7 +207,7 @@ async function sendToChatSession(state: SharedFeishuState, chatId: string, promp
 		});
 		if (result.cancelled) throw new Error("创建飞书群专属 Pi 会话已取消。");
 	} finally {
-		state.bindingGroupChat = false;
+		state.switchingSession = false;
 	}
 }
 
@@ -489,6 +499,9 @@ export default function feishuExtension(pi: ExtensionAPI): void {
 	});
 	pi.on("session_shutdown", () => {
 		// 长连接归全局 controller 保管，本地 /new 切换会话后自动延续。
+		// 本扩展为群/私聊路由发起的 switch/newSession 会让 Pi 对旧会话发 shutdown；
+		// 那不是真正的会话关闭，此刻轮次刚要开始，绝不能取消，否则回复永远传不回飞书。
+		if (state.switchingSession) return;
 		state.activeBridge?.cancel("Pi 会话已关闭。");
 	});
 
