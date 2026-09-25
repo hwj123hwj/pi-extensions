@@ -90,6 +90,20 @@ export interface FeishuControllerOptions {
 	generateBindingCode?: () => string;
 	/** 落盘去重记录的路径；默认与凭据同目录，测试注入临时路径。 */
 	deduplicationPath?: string;
+	/** 本地忙闲轮询间隔（测试可调小）。 */
+	idlePollMs?: number;
+	/** 本地 Pi 持续繁忙多久后放弃处理（默认 15 分钟）。 */
+	localBusyTimeoutMs?: number;
+	/** 繁忙持续多久后给聊天发等待提示（默认 3 秒）。 */
+	busyNotifyAfterMs?: number;
+}
+
+const DEFAULT_IDLE_POLL_MS = 2000;
+const DEFAULT_LOCAL_BUSY_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_BUSY_NOTIFY_AFTER_MS = 3000;
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 export interface FeishuStartResult {
@@ -106,6 +120,11 @@ export class FeishuController {
 	private readonly generateBindingCode: (() => string) | undefined;
 	private readonly queue = new SerialMessageQueue();
 	private readonly deduplicator: MessageDeduplicator;
+	private readonly idlePollMs: number;
+	private readonly localBusyTimeoutMs: number;
+	private readonly busyNotifyAfterMs: number;
+	/** stop() 置位：让本地忙闲等待循环立即退出。 */
+	private stopped = false;
 	private gateway: FeishuGateway | undefined;
 	private credentials: FeishuCredentials | undefined;
 	private binding: OwnerBinding | undefined;
@@ -122,6 +141,9 @@ export class FeishuController {
 		this.agent = options.agent;
 		this.runtime = options.runtime;
 		this.generateBindingCode = options.generateBindingCode;
+		this.idlePollMs = options.idlePollMs ?? DEFAULT_IDLE_POLL_MS;
+		this.localBusyTimeoutMs = options.localBusyTimeoutMs ?? DEFAULT_LOCAL_BUSY_TIMEOUT_MS;
+		this.busyNotifyAfterMs = options.busyNotifyAfterMs ?? DEFAULT_BUSY_NOTIFY_AFTER_MS;
 		// 对齐 easycodeclient：受理即落盘的去重记录，进程重启后飞书重推也不会重复执行。
 		this.deduplicator = new MessageDeduplicator(5000, options.deduplicationPath ?? defaultProcessedMessagesPath());
 	}
@@ -170,6 +192,7 @@ export class FeishuController {
 		this.binding = binding;
 		this.gateway = gateway;
 		this.environment = environment;
+		this.stopped = false;
 		// 恢复落盘的受理记录：重启后飞书重推的事件仍会被去重，而不是重复驱动 Pi。
 		await this.deduplicator.hydrate();
 
@@ -250,6 +273,13 @@ export class FeishuController {
 		return Object.values(sessions).includes(sessionFile);
 	}
 
+	/** 向指定聊天发一条提示文字（fire-and-forget，失败静默）。 */
+	async notifyChat(chatId: string, text: string): Promise<void> {
+		const gateway = this.gateway;
+		if (!gateway) return;
+		await gateway.sendText(chatId, text).catch(() => undefined);
+	}
+
 	async setChatSessionFile(chatId: string, sessionFile: string): Promise<void> {
 		const credentials = this.credentials;
 		if (!credentials) return;
@@ -286,6 +316,7 @@ export class FeishuController {
 	async stop(): Promise<boolean> {
 		const gateway = this.gateway;
 		if (!gateway) return false;
+		this.stopped = true;
 		this.botAddedUnsubscribe?.();
 		this.botAddedUnsubscribe = undefined;
 		for (const entry of this.pendingTasks.values()) entry.cancelled = true;
@@ -835,8 +866,50 @@ export class FeishuController {
 		this.credentials = next;
 	}
 
+	/**
+	 * 等待本地 Pi 空闲。超过 localBusyTimeoutMs 仍繁忙则放弃（返回 false），
+	 * 等待超过 3 秒时先给聊天发一条提示，让用户知道消息没有丢。
+	 */
+	private async waitForLocalIdle(gateway: FeishuGateway, message: FeishuIncomingMessage): Promise<boolean> {
+		const runtime = this.runtime;
+		if (!runtime) return true;
+		const start = Date.now();
+		let notified = false;
+		for (;;) {
+			if (this.stopped || this.gateway !== gateway) return false;
+			let idle: boolean;
+			try {
+				idle = runtime.isIdle();
+			} catch {
+				idle = true; // 忙闲未知（ctx 失效等）时不得阻塞消息处理。
+			}
+			if (idle) return true;
+			const waitedMs = Date.now() - start;
+			if (waitedMs > this.localBusyTimeoutMs) return false;
+			if (!notified && waitedMs > this.busyNotifyAfterMs) {
+				notified = true;
+				await gateway
+					.sendText(
+						message.chatId,
+						"⏳ 本地 Pi 正在执行任务，本条消息将在其完成后处理（不会打断本地任务）。",
+						message.messageId,
+					)
+					.catch(() => undefined);
+			}
+			await sleep(this.idlePollMs);
+		}
+	}
+
 	private async processWithAgent(gateway: FeishuGateway, message: FeishuIncomingMessage, text: string): Promise<void> {
 		if (this.gateway !== gateway) return;
+		// Pi 是单会话进程：本地 TUI 正在跑的任务会被会话切换 abort 掉。
+		// 因此驱动 Pi 之前先等本地空闲，绝不打断用户手头的工作。
+		if (!(await this.waitForLocalIdle(gateway, message))) {
+			await gateway
+				.sendText(message.chatId, "⏳ 本地 Pi 长时间繁忙，本条消息已取消处理，请稍后重发。", message.messageId)
+				.catch(() => undefined);
+			return;
+		}
 		const reply = await gateway.beginReply(message.chatId, message.messageId).catch(() => undefined);
 		if (reply) this.activeReplies.add(reply);
 		let latestText = "";

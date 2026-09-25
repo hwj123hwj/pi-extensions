@@ -241,16 +241,24 @@ async function sendToChatSession(state: SharedFeishuState, chatId: string, promp
 		if (sessionFile) {
 			// Pi 的 TUI switchSession 不透传 cwdOverride，改为把 cwd 写进会话头：
 			// SessionManager.open 切换时从 header 读取 cwd，runtime 随之在新目录重建。
-			if (directory && !(await anchorSessionHeaderCwd(sessionFile, directory))) {
-				throw new Error(`无法把群会话锚定到 ${directory}（会话文件不可写或格式未知）。`);
+			// 会话文件可能尚未落盘（Pi 要等首条 assistant 回复才写文件）——此时跳过
+			// 锚定正常处理，本轮回复落盘后下一轮自动生效，绝不因锚定失败终止消息。
+			let anchored = true;
+			if (directory) {
+				anchored = await anchorSessionHeaderCwd(sessionFile, directory);
 			}
 			const result = await context.switchSession(sessionFile, {
 				withSession: (nextContext) => {
-					if (directory) assertAnchoredCwd(nextContext, directory);
+					if (directory && anchored) checkAnchoredCwd(state, chatId, nextContext, directory);
 					return sendAndTrackGroupSession(state, chatId, sessionFile, nextContext, prompt);
 				},
 			});
 			if (result.cancelled) throw new Error("切换到飞书群绑定的 Pi 会话已取消。");
+			if (directory && !anchored) {
+				await state.controller
+					.notifyChat(chatId, "ℹ️ 本群的目录锚定将在下一条消息生效（当前会话文件尚未写入磁盘）。")
+					.catch(() => undefined);
+			}
 			return;
 		}
 
@@ -259,21 +267,12 @@ async function sendToChatSession(state: SharedFeishuState, chatId: string, promp
 				state.latestCommandContext = nextContext;
 				const currentFile = nextContext.sessionManager.getSessionFile();
 				if (currentFile) await state.controller.setChatSessionFile(chatId, currentFile);
-				if (currentFile && directory) {
-					// 新会话默认继承当前 cwd：把会话头 cwd 改写为绑定目录后重新切换一次，
-					// runtime 会以新 cwd 重建，然后才投递消息。
-					if (!(await anchorSessionHeaderCwd(currentFile, directory))) {
-						throw new Error(`无法把群会话锚定到 ${directory}（会话文件不可写或格式未知）。`);
-					}
-					const anchored = await nextContext.switchSession(currentFile, {
-						withSession: (finalContext) => {
-							state.latestCommandContext = finalContext;
-							assertAnchoredCwd(finalContext, directory);
-							return finalContext.sendUserMessage(prompt);
-						},
-					});
-					if (anchored.cancelled) throw new Error("锚定群会话工作目录已取消。");
-					return;
+				if (directory) {
+					// 全新会话的文件还没落盘（Pi 等首条 assistant 回复才写）：本轮先在
+					// 继承的目录下处理，回复落盘后下一轮消息到来时锚定自动生效。
+					await state.controller
+						.notifyChat(chatId, `ℹ️ 本群已锚定到目录：${directory}，将从下一条消息开始在该目录下工作。`)
+						.catch(() => undefined);
 				}
 				await nextContext.sendUserMessage(prompt);
 			},
@@ -320,12 +319,18 @@ export async function anchorSessionHeaderCwd(sessionFile: string, directory: str
 	return true;
 }
 
-function assertAnchoredCwd(context: ExtensionContext, directory: string): void {
+/** 锚定后校验 runtime cwd 是否真的切了过去；不符只提示，不终止消息。 */
+function checkAnchoredCwd(
+	state: SharedFeishuState,
+	chatId: string,
+	context: ExtensionContext,
+	directory: string,
+): void {
 	const effective = safeCwd(context);
 	if (effective && resolvePath(effective) !== resolvePath(directory)) {
-		throw new Error(
-			`群会话未能切换到绑定目录（当前：${effective}）。请重启本地 Pi 后重试，或在本地执行 /feishu status 刷新会话控制。`,
-		);
+		void state.controller
+			.notifyChat(chatId, `⚠️ 群会话未能切换到绑定目录（当前：${effective}，期望：${directory}）。`)
+			.catch(() => undefined);
 	}
 }
 

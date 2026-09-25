@@ -426,7 +426,8 @@ describe("FeishuController", () => {
 			});
 		await controller.start({});
 		await gateway.emit(privateText({ text: "long task" }));
-		await Promise.resolve();
+		// 等队列任务真正开工（多个微任务边界），保证 reply 已登记进 activeReplies
+		await new Promise((resolve) => setTimeout(resolve, 0));
 		await controller.stop();
 		rejectRun?.(new Error("cancelled"));
 		await controller.waitForIdle();
@@ -545,7 +546,6 @@ describe("FeishuController", () => {
 
 	it("runs slash commands through the runtime while a long task keeps the queue busy", async () => {
 		const runtime = new FakeRuntime();
-		runtime.idle = false;
 		runtime.snapshotValue = { streaming: true, model: "Test Model", thinkingLevel: "medium", contextPercent: 42.4 };
 		const { gateway, agent, controller } = createFixture(
 			{
@@ -556,10 +556,13 @@ describe("FeishuController", () => {
 			runtime,
 		);
 		const releases: Array<() => void> = [];
-		agent.runImpl = () =>
-			new Promise<string>((resolve) => {
+		agent.runImpl = () => {
+			// 任务开工后 Pi 进入 streaming：/stop 才会走"中止运行中任务"分支
+			runtime.idle = false;
+			return new Promise<string>((resolve) => {
 				releases.push(() => resolve("done"));
 			});
+		};
 		await controller.start({});
 
 		await gateway.emit(privateText({ messageId: "om_first", text: "long task" }));
@@ -633,7 +636,6 @@ describe("FeishuController", () => {
 
 	it("stops the running task and skips queued messages on /stop", async () => {
 		const runtime = new FakeRuntime();
-		runtime.idle = false;
 		const { gateway, agent, controller } = createFixture(
 			{
 				appId: "cli_test",
@@ -643,10 +645,12 @@ describe("FeishuController", () => {
 			runtime,
 		);
 		const releases: Array<() => void> = [];
-		agent.runImpl = (text) =>
-			new Promise<string>((resolve) => {
+		agent.runImpl = (text) => {
+			if (text === "first") runtime.idle = false; // 任务开工 → Pi streaming
+			return new Promise<string>((resolve) => {
 				releases.push(() => resolve(`done: ${text}`));
 			});
+		};
 		await controller.start({});
 
 		await gateway.emit(privateText({ messageId: "om_first", text: "first" }));
@@ -1198,5 +1202,74 @@ describe("FeishuController", () => {
 		for (const release of releases) release?.();
 		await controller.waitForIdle();
 		expect(agent.calls).toEqual(["long task", "[飞书群聊] ou_owner：群消息"]);
+	});
+
+	it("delays dispatch while local Pi is busy and notifies the chat", async () => {
+		const runtime = new FakeRuntime();
+		runtime.idle = false; // 本地忙
+		const store = new MemoryCredentialStore();
+		store.state = {
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		};
+		const gateway = new FakeGateway();
+		const agent = new FakeAgent();
+		const controller = new FeishuController({
+			store,
+			gatewayFactory: () => gateway,
+			validateCredentials: async () => undefined,
+			agent,
+			runtime,
+			generateBindingCode: () => "123456",
+			deduplicationPath: join(tmpdir(), `pi-feishu-test-${randomUUID()}.json`),
+			idlePollMs: 10,
+			busyNotifyAfterMs: 30,
+		});
+		await controller.start({});
+
+		await gateway.emit(privateText({ messageId: "om_wait", text: "hello" }));
+		await new Promise((resolve) => setTimeout(resolve, 60));
+
+		// 仍然繁忙：任务没有开工，但聊天收到了等待提示
+		expect(agent.calls).toEqual([]);
+		expect(gateway.sent.some((entry) => entry.text.includes("本地 Pi 正在执行任务"))).toBe(true);
+
+		// 本地空闲后任务开工
+		runtime.idle = true;
+		await controller.waitForIdle();
+		expect(agent.calls).toEqual(["hello"]);
+	});
+
+	it("gives up waiting when local Pi stays busy beyond the timeout", async () => {
+		const runtime = new FakeRuntime();
+		runtime.idle = false; // 一直繁忙
+		const store = new MemoryCredentialStore();
+		store.state = {
+			appId: "cli_test",
+			appSecret: "secret",
+			ownerOpenId: "ou_owner",
+		};
+		const gateway = new FakeGateway();
+		const agent = new FakeAgent();
+		const controller = new FeishuController({
+			store,
+			gatewayFactory: () => gateway,
+			validateCredentials: async () => undefined,
+			agent,
+			runtime,
+			generateBindingCode: () => "123456",
+			deduplicationPath: join(tmpdir(), `pi-feishu-test-${randomUUID()}.json`),
+			idlePollMs: 10,
+			localBusyTimeoutMs: 80,
+			busyNotifyAfterMs: 30,
+		});
+		await controller.start({});
+
+		await gateway.emit(privateText({ messageId: "om_giveup", text: "hello" }));
+		await controller.waitForIdle();
+
+		expect(agent.calls).toEqual([]);
+		expect(gateway.sent.some((entry) => entry.text.includes("长时间繁忙"))).toBe(true);
 	});
 });
