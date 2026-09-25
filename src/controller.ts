@@ -556,7 +556,11 @@ export class FeishuController {
 		}
 		if (!isDirectory) {
 			await gateway
-				.sendText(message.chatId, `❌ 目录不存在或不是文件夹：${resolved}\n用法：/bind /path/to/project`, message.messageId)
+				.sendText(
+					message.chatId,
+					`❌ 目录不存在或不是文件夹：${resolved}\n用法：/bind /path/to/project`,
+					message.messageId,
+				)
 				.catch(() => undefined);
 			return;
 		}
@@ -902,9 +906,10 @@ export class FeishuController {
 
 	private async processWithAgent(gateway: FeishuGateway, message: FeishuIncomingMessage, text: string): Promise<void> {
 		if (this.gateway !== gateway) return;
-		// Pi 是单会话进程：本地 TUI 正在跑的任务会被会话切换 abort 掉。
-		// 因此驱动 Pi 之前先等本地空闲，绝不打断用户手头的工作。
-		if (!(await this.waitForLocalIdle(gateway, message))) {
+		// p2p 私聊在本地 Pi 进程内驱动：本地 TUI 正在跑的任务会被会话切换 abort 掉，
+		// 因此先等本地空闲，绝不打断用户手头的工作。
+		// 群消息由独立 pi 子进程承载，与本地会话互不影响，无需等待。
+		if (message.chatType !== "group" && !(await this.waitForLocalIdle(gateway, message))) {
 			await gateway
 				.sendText(message.chatId, "⏳ 本地 Pi 长时间繁忙，本条消息已取消处理，请稍后重发。", message.messageId)
 				.catch(() => undefined);

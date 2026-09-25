@@ -196,9 +196,12 @@ export function buildScopeHealthSection(appId: string, grantedScopes?: readonly 
 	const missing = missingScopes(grantedScopes, REQUIRED_APP_SCOPES);
 	const hasGroupMsg = hasScope(grantedScopes, SENSITIVE_GROUP_MSG_SCOPE);
 	if (missing.length === 0 && hasGroupMsg) {
-		return ["✅ 应用权限配置完整，所有功能均可正常使用。", "", "本 Bot 依赖以下权限（均已开通）：", ...renderScopeInventory()].join(
-			"\n",
-		);
+		return [
+			"✅ 应用权限配置完整，所有功能均可正常使用。",
+			"",
+			"本 Bot 依赖以下权限（均已开通）：",
+			...renderScopeInventory(),
+		].join("\n");
 	}
 	const lines = ["⚠️ 以下应用权限尚未开通，对应功能会受限："];
 	if (missing.length > 0) {

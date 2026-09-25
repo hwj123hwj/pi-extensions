@@ -1,5 +1,4 @@
-import { readFile, writeFile } from "node:fs/promises";
-import { resolve as resolvePath } from "node:path";
+import { rm } from "node:fs/promises";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
@@ -7,19 +6,18 @@ import type {
 	ProjectTrustHandler,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { AgentBridge, FeishuStatus, PiModelInfo, PiRuntime, PiRuntimeSnapshot } from "./contracts.js";
-
-/** switchSession/withSession 回调里的新会话上下文；Pi 未从包根导出该类型名，从签名提取。 */
-type SwitchCallback = NonNullable<
-	Parameters<ExtensionCommandContext["switchSession"]>[1] extends infer O | undefined
-		? O extends { withSession?: (ctx: infer C) => unknown }
-			? C
-			: never
-		: never
->;
+import type {
+	AgentBridge,
+	AgentProgressObserver,
+	FeishuStatus,
+	PiModelInfo,
+	PiRuntime,
+	PiRuntimeSnapshot,
+} from "./contracts.js";
 import { FeishuController } from "./controller.js";
 import { CredentialError, FileCredentialStore } from "./credentials.js";
 import { SdkFeishuGateway, validateSdkCredentials } from "./gateway.js";
+import { defaultGroupSessionFile, GroupAgentRunner } from "./group-agent.js";
 import { PiAgentBridge } from "./pi-agent-bridge.js";
 import { THINKING_LEVELS } from "./remote-commands.js";
 import {
@@ -58,6 +56,8 @@ interface SharedFeishuState {
 	 *   不能据此取消正在等待的飞书轮次（否则群消息必然失败）。
 	 */
 	switchingSession: boolean;
+	/** 群消息子进程运行器（每群独立 pi -p 进程，不碰本地会话）。 */
+	groupRunner: GroupAgentRunner;
 }
 
 const SHARED_STATE_KEY = "__piFeishuSharedState__";
@@ -80,15 +80,16 @@ function getSharedState(): SharedFeishuState {
 		mainSessionFile: undefined,
 		currentSessionFile: undefined,
 		switchingSession: false,
+		groupRunner: new GroupAgentRunner(),
 		controller: undefined as unknown as FeishuController,
 	};
 	const proxyAgent: AgentBridge = {
 		run: (text, observer, options) => {
+			if (options?.chatId) {
+				// 群消息走独立 pi 子进程：不切本地会话、不碰 TUI、目录天然锚定。
+				return runGroupAgent(state, options.chatId, text, observer);
+			}
 			const bridge = new PiAgentBridge(async (prompt) => {
-				if (options?.chatId) {
-					await sendToChatSession(state, options.chatId, prompt);
-					return;
-				}
 				await sendToMainSession(state, prompt);
 			});
 			state.activeBridge = bridge;
@@ -96,9 +97,14 @@ function getSharedState(): SharedFeishuState {
 				if (state.activeBridge === bridge) state.activeBridge = undefined;
 			});
 		},
-		cancel: (reason) => state.activeBridge?.cancel(reason),
+		cancel: (reason) => {
+			state.activeBridge?.cancel(reason);
+			// 群消息由独立子进程承载：一并终止它们。
+			state.groupRunner.stop();
+		},
 		steer: (text) => {
 			// 仅当确有飞书轮次在跑时并入：发到当前活跃会话（轮次就在那里），绝不触发会话切换。
+			// 群消息走独立子进程，不经过这里。
 			if (!state.activeBridge || !state.sendCurrentMessage) return false;
 			try {
 				state.sendCurrentMessage(text, { deliverAs: "steer" });
@@ -115,22 +121,13 @@ function getSharedState(): SharedFeishuState {
 		compact: () => state.current?.runtime.compact(),
 		newSession: () => state.current?.runtime.newSession() ?? Promise.resolve(false),
 		newChatSession: async (chatId) => {
-			const context = state.latestCommandContext;
-			if (!context) return false;
-			state.switchingSession = true;
+			// 群会话由独立子进程承载：/new 等价于删除该群的 session 文件，
+			// 下一条群消息的子进程会以全新历史启动。
 			try {
-				const result = await context.newSession({
-					withSession: async (nextContext) => {
-						state.latestCommandContext = nextContext;
-						const sessionFile = nextContext.sessionManager.getSessionFile();
-						if (sessionFile) await state.controller.setChatSessionFile(chatId, sessionFile);
-					},
-				});
-				return !result.cancelled;
-			} catch (error) {
-				rethrowStaleAsHint(state, error);
-			} finally {
-				state.switchingSession = false;
+				await rm(defaultGroupSessionFile(chatId), { force: true });
+				return true;
+			} catch {
+				return false;
 			}
 		},
 		setThinkingLevel: (level) => state.current?.runtime.setThinkingLevel(level) ?? Promise.resolve(false),
@@ -225,134 +222,24 @@ async function sendToMainSession(state: SharedFeishuState, prompt: string): Prom
 	}
 }
 
-async function sendToChatSession(state: SharedFeishuState, chatId: string, prompt: string): Promise<void> {
-	const sessionFile = state.controller.getChatSessionFile(chatId);
-	// Pi 侧切换后当前会话可能恰好就是目标群会话：此时无需命令上下文，直接投递。
-	if (sessionFile && sessionFile === state.currentSessionFile && state.sendCurrentMessage) {
-		state.sendCurrentMessage(prompt);
-		return;
-	}
-	const context = state.latestCommandContext;
-	if (!context) throw new Error(SESSION_CONTROL_HINT);
-
-	const directory = state.controller.getChatDirectory(chatId);
-	state.switchingSession = true;
-	try {
-		if (sessionFile) {
-			// Pi 的 TUI switchSession 不透传 cwdOverride，改为把 cwd 写进会话头：
-			// SessionManager.open 切换时从 header 读取 cwd，runtime 随之在新目录重建。
-			// 会话文件可能尚未落盘（Pi 要等首条 assistant 回复才写文件）——此时跳过
-			// 锚定正常处理，本轮回复落盘后下一轮自动生效，绝不因锚定失败终止消息。
-			let anchored = true;
-			if (directory) {
-				anchored = await anchorSessionHeaderCwd(sessionFile, directory);
-			}
-			const result = await context.switchSession(sessionFile, {
-				withSession: (nextContext) => {
-					if (directory && anchored) checkAnchoredCwd(state, chatId, nextContext, directory);
-					return sendAndTrackGroupSession(state, chatId, sessionFile, nextContext, prompt);
-				},
-			});
-			if (result.cancelled) throw new Error("切换到飞书群绑定的 Pi 会话已取消。");
-			if (directory && !anchored) {
-				await state.controller
-					.notifyChat(chatId, "ℹ️ 本群的目录锚定将在下一条消息生效（当前会话文件尚未写入磁盘）。")
-					.catch(() => undefined);
-			}
-			return;
-		}
-
-		const result = await context.newSession({
-			withSession: async (nextContext) => {
-				state.latestCommandContext = nextContext;
-				const currentFile = nextContext.sessionManager.getSessionFile();
-				if (currentFile) await state.controller.setChatSessionFile(chatId, currentFile);
-				if (directory) {
-					// 全新会话的文件还没落盘（Pi 等首条 assistant 回复才写）：本轮先在
-					// 继承的目录下处理，回复落盘后下一轮消息到来时锚定自动生效。
-					await state.controller
-						.notifyChat(chatId, `ℹ️ 本群已锚定到目录：${directory}，将从下一条消息开始在该目录下工作。`)
-						.catch(() => undefined);
-				}
-				await nextContext.sendUserMessage(prompt);
-			},
-		});
-		if (result.cancelled) throw new Error("创建飞书群专属 Pi 会话已取消。");
-	} catch (error) {
-		rethrowStaleAsHint(state, error);
-	} finally {
-		state.switchingSession = false;
-	}
-}
-
-/**
- * 把会话文件头（JSONL 首行的 session header）里的 cwd 改写为绑定目录。
- * 群会话空闲时文件不被任何 runtime 持有，重写首行是安全的；下次
- * SessionManager.open 会以新 cwd 重建 runtime（工具、bash 都在新目录执行）。
- * 返回 false 表示文件不可读/格式未知，调用方给出可操作错误。
- */
-export async function anchorSessionHeaderCwd(sessionFile: string, directory: string): Promise<boolean> {
-	let raw: string;
-	try {
-		raw = await readFile(sessionFile, "utf8");
-	} catch {
-		return false;
-	}
-	const newlineIndex = raw.indexOf("\n");
-	const firstLine = newlineIndex === -1 ? raw : raw.slice(0, newlineIndex);
-	let header: Record<string, unknown>;
-	try {
-		header = JSON.parse(firstLine) as Record<string, unknown>;
-	} catch {
-		return false;
-	}
-	if (header.type !== "session" || typeof header.cwd !== "string") return false;
-	if (resolvePath(header.cwd) === resolvePath(directory)) return true;
-	header.cwd = directory;
-	const updatedFirstLine = JSON.stringify(header);
-	const updated = newlineIndex === -1 ? updatedFirstLine : updatedFirstLine + raw.slice(newlineIndex);
-	try {
-		await writeFile(sessionFile, updated, "utf8");
-	} catch {
-		return false;
-	}
-	return true;
-}
-
-/** 锚定后校验 runtime cwd 是否真的切了过去；不符只提示，不终止消息。 */
-function checkAnchoredCwd(
+/** 群消息：spawn 独立 pi 子进程（cwd=绑定目录，session 文件按群隔离）。 */
+async function runGroupAgent(
 	state: SharedFeishuState,
 	chatId: string,
-	context: ExtensionContext,
-	directory: string,
-): void {
-	const effective = safeCwd(context);
-	if (effective && resolvePath(effective) !== resolvePath(directory)) {
-		void state.controller
-			.notifyChat(chatId, `⚠️ 群会话未能切换到绑定目录（当前：${effective}，期望：${directory}）。`)
-			.catch(() => undefined);
-	}
-}
-
-function safeCwd(context: ExtensionContext): string | undefined {
-	try {
-		return context.cwd;
-	} catch {
-		return undefined;
-	}
-}
-
-async function sendAndTrackGroupSession(
-	state: SharedFeishuState,
-	chatId: string,
-	sessionFile: string,
-	nextContext: SwitchCallback,
 	prompt: string,
-): Promise<void> {
-	state.latestCommandContext = nextContext;
-	const currentFile = nextContext.sessionManager.getSessionFile();
-	if (currentFile && currentFile !== sessionFile) await state.controller.setChatSessionFile(chatId, currentFile);
-	await nextContext.sendUserMessage(prompt);
+	observer: AgentProgressObserver | undefined,
+): Promise<string> {
+	const directory = state.controller.getChatDirectory(chatId);
+	const sessionFile = defaultGroupSessionFile(chatId);
+	try {
+		const result = await state.groupRunner.run(sessionFile, directory, prompt, observer);
+		return result.text || "Pi 已完成处理，但没有返回文本内容。";
+	} catch (error) {
+		const reason = state.controller.sanitizeError(error);
+		throw new Error(
+			`${reason}（群聊由独立 pi 进程处理${directory ? `，工作目录：${directory}` : ""}；若 pi 不在 PATH 中，可设置 PI_BIN 环境变量）`,
+		);
+	}
 }
 
 export interface ParsedFeishuCommand {

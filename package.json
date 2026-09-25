@@ -1,6 +1,6 @@
 {
 	"name": "@hwj123weijian/pi-feishu",
-	"version": "0.11.3",
+	"version": "0.12.0",
 	"description": "Feishu private-chat and managed-group bridge for Pi",
 	"type": "module",
 	"license": "MIT",
